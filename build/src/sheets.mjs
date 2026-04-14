@@ -137,7 +137,7 @@ export function calcUsd(amount, rate) {
 }
 
 /** Append a row to расходы (columns B..K). */
-export async function appendRashod(data) {
+export async function appendExpense(data) {
   const amount = toNumber(data.amount);
   const rate = data.currency === "USD" ? 1 : toNumber(data.rate);
   const usd = data.amount_usd != null ? toNumber(data.amount_usd) : calcUsd(amount, rate);
@@ -151,7 +151,7 @@ export async function appendRashod(data) {
 }
 
 /** Append a row to платежи (columns A..K). */
-export async function appendPlatezh(data) {
+export async function appendPayment(data) {
   const amount = toNumber(data.amount);
   const rate = data.currency === "USD" ? 1 : toNumber(data.rate);
   const usd = data.amount_usd != null ? toNumber(data.amount_usd) : calcUsd(amount, rate);
@@ -165,7 +165,7 @@ export async function appendPlatezh(data) {
 }
 
 /** Append a row to ддс (columns A..H). */
-export async function appendDds(data) {
+export async function appendTransfer(data) {
   const period = data.period || periodFromDate(data.date);
   return append("ддс", "A:H", [
     data.date || "", toNumber(data.amount),
@@ -184,6 +184,112 @@ export async function appendIteration(data) {
     toNumber(data.amount), toNumber(data.amount),
     data.currency || "SOM",
   ]);
+}
+
+// ───────────────────────────────────────────────────────────────────────────
+// Auto-fill & duplicate detection (used by MCP append tool)
+// ───────────────────────────────────────────────────────────────────────────
+
+/**
+ * Column layout for known sheets (0-based indices within the append range).
+ */
+const SHEET_LAYOUTS = {
+  "расходы":  { range: "B:K", date: 0, category: 1, amount: 2, rate: 3, currency: 4, sumUsd: 5, period: 6 },
+  "платежи":  { range: "A:K", date: 7, project: 1, amount: 2, rate: 4, currency: 5, sumUsd: 6, period: 8 },
+  "ддс":      { range: "A:H", date: 0, amount: 1, period: 5 },
+  "итерации": { range: "A:G", uniqueKey: 1 },
+};
+
+/**
+ * Read the most recent non-empty exchange rate from column E of a sheet.
+ */
+async function getRecentRate(sheet) {
+  const result = await read(sheet, "E:E", 20);
+  for (let i = result.rows.length - 1; i >= 0; i--) {
+    const cells = result.rows[i].values || result.rows[i];
+    const val = toNumber(cells[0]);
+    if (typeof val === "number" && val > 0) return val;
+  }
+  return null;
+}
+
+/**
+ * Auto-fill calculated columns (rate, sum$, period) for known sheets.
+ * Only fills empty values — never overwrites provided data.
+ */
+export async function autoFillValues(sheet, range, values) {
+  const layout = SHEET_LAYOUTS[sheet];
+  if (!layout || layout.range !== range) return values;
+
+  // Rate
+  if (layout.rate != null && !values[layout.rate]) {
+    const currency = String(values[layout.currency] || "").toUpperCase();
+    if (currency === "USD") {
+      values[layout.rate] = 1;
+    } else {
+      const rate = await getRecentRate(sheet);
+      if (rate) values[layout.rate] = rate;
+    }
+  }
+
+  // Sum USD
+  if (layout.sumUsd != null && !values[layout.sumUsd]) {
+    const amount = toNumber(values[layout.amount]);
+    const rate = toNumber(values[layout.rate]);
+    if (typeof amount === "number" && typeof rate === "number" && rate > 0) {
+      values[layout.sumUsd] = calcUsd(amount, rate);
+    }
+  }
+
+  // Period
+  if (layout.period != null && !values[layout.period] && values[layout.date]) {
+    values[layout.period] = periodFromDate(values[layout.date]);
+  }
+
+  return values;
+}
+
+/**
+ * Check for duplicate entries in the last 50 rows.
+ * Matches on date + amount + category/project (strict match on all three).
+ * Returns the matching row or null.
+ */
+export async function checkDuplicate(sheet, range, values) {
+  const layout = SHEET_LAYOUTS[sheet];
+  if (!layout || layout.range !== range) return null;
+
+  const result = await read(sheet, range, 50);
+
+  // Unique key match (e.g. iteration_id for итерации)
+  if (layout.uniqueKey != null) {
+    const newKey = String(values[layout.uniqueKey] || "").trim().toLowerCase();
+    if (!newKey) return null;
+    for (const row of result.rows) {
+      const cells = row.values || row;
+      if (String(cells[layout.uniqueKey] || "").trim().toLowerCase() === newKey) {
+        return { row: row.row, values: cells };
+      }
+    }
+    return null;
+  }
+
+  // Date + amount + category/project match
+  const newDate = String(values[layout.date] || "").trim();
+  const newAmount = toNumber(values[layout.amount]);
+  const groupIdx = layout.category ?? layout.project ?? null;
+  const newGroup = groupIdx != null ? String(values[groupIdx] || "").trim().toLowerCase() : null;
+
+  if (!newDate || !newAmount) return null;
+
+  for (const row of result.rows) {
+    const cells = row.values || row;
+    if (String(cells[layout.date] || "").trim() !== newDate) continue;
+    if (toNumber(cells[layout.amount]) !== newAmount) continue;
+    if (groupIdx != null && String(cells[groupIdx] || "").trim().toLowerCase() !== newGroup) continue;
+    return { row: row.row, values: cells };
+  }
+
+  return null;
 }
 
 /** Get next iteration number for a project. */

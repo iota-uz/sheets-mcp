@@ -14,9 +14,9 @@ import { fileURLToPath } from "url";
 
 import { readBankStatement } from "../src/excel.mjs";
 import {
-  appendRashod,
-  appendDds,
-  appendPlatezh,
+  appendExpense,
+  appendTransfer,
+  appendPayment,
   appendIteration,
   getNextIteration,
 } from "../src/sheets.mjs";
@@ -381,7 +381,7 @@ for (const row of buckets.платежи) {
     });
 
     // Step 3: add row to "платежи"
-    const res = await appendPlatezh({
+    const res = await appendPayment({
       iteration: iter.nextId,
       project: cls.project,
       amount: row.credit,
@@ -408,7 +408,7 @@ for (const row of buckets.ддс) {
   const data = {
     date: row.doc_date,
     amount: row.debit,
-    // source_account, target_account, type — use defaults from appendDds
+    // source_account, target_account, type — use defaults from appendTransfer
   };
 
   if (dryRun) {
@@ -417,7 +417,7 @@ for (const row of buckets.ддс) {
   }
 
   try {
-    const res = await appendDds(data);
+    const res = await appendTransfer(data);
     success++;
     console.log(`✓ [ддс] #${row.row_num} ${row.doc_date} ${row.debit.toLocaleString("ru-RU")} @ ${res.range}`);
   } catch (err) {
@@ -450,7 +450,7 @@ for (const row of buckets.расходы) {
   }
 
   try {
-    const res = await appendRashod(data);
+    const res = await appendExpense(data);
     success++;
     console.log(
       `✓ #${row.row_num} ${row.doc_date} ${row.debit.toLocaleString("ru-RU")} → ${cls.category}` +

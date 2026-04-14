@@ -21,8 +21,9 @@ import {
   ListToolsRequestSchema,
 } from "@modelcontextprotocol/sdk/types.js";
 
-import { read, append, update, info, getNextIteration } from "./sheets.mjs";
+import { read, append, update, info, getNextIteration, autoFillValues, checkDuplicate } from "./sheets.mjs";
 import { readFinancesChannel } from "./discord.mjs";
+import { reconcile } from "./reconcile.mjs";
 
 // ───────────────────────────────────────────────────────────────────────────
 // Tool definitions
@@ -98,6 +99,19 @@ const tools = [
     },
   },
   {
+    name: "iota_reconcile",
+    description:
+      "Find the source of balance discrepancy in 'Счета'. Reads 'Разница' (actual vs table balance), scans current-month transactions across расходы/платежи/ддс, and returns suspicious rows (exact amount match, doubled/halved, currency mistake, decimal shift).",
+    inputSchema: {
+      type: "object",
+      properties: {
+        period:    { type: "string", description: "Расчётный период (e.g. '01.04.2026'). Defaults to current month." },
+        tolerance: { type: "number", description: "USD tolerance for exact matching (default 1.0)." },
+        ratePct:   { type: "number", description: "% tolerance for currency-error detection (default 2)." },
+      },
+    },
+  },
+  {
     name: "iota_discord_read_finances",
     description:
       "Read recent messages from the Discord #finances channel. Downloads image attachments to Reports/discord/ for visual inspection via Read tool.",
@@ -117,10 +131,19 @@ const tools = [
 
 const handlers = {
   iota_sheets_read: (a) => read(a.sheet, a.range, a.last_n),
-  iota_sheets_append: (a) => append(a.sheet, a.range, a.values),
+  iota_sheets_append: async (a) => {
+    const values = [...a.values];
+    await autoFillValues(a.sheet, a.range, values);
+    const dup = await checkDuplicate(a.sheet, a.range, values);
+    if (dup) {
+      return { skipped: true, reason: "Duplicate entry detected — same date, amount, and category already exists", existing_row: dup.row };
+    }
+    return append(a.sheet, a.range, values);
+  },
   iota_sheets_update: (a) => update(a.sheet, a.cell, a.value),
   iota_sheets_info: (a) => info(a?.sheet),
   iota_next_iteration: (a) => getNextIteration(a.project),
+  iota_reconcile: (a) => reconcile({ period: a?.period, tolerance: a?.tolerance, ratePct: a?.ratePct }),
   iota_discord_read_finances: (a) => readFinancesChannel({ limit: a?.limit, after: a?.after }),
 };
 
