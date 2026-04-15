@@ -1,8 +1,8 @@
 {
   "mcpServers": {
-    "iota-sheets": {
+    "sheets": {
       "command": "node",
-      "args": ["build/src/mcp-server.mjs"]
+      "args": ["mcp/server.mjs"]
     }
   }
 }

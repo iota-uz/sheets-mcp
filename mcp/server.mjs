@@ -1,17 +1,17 @@
 #!/usr/bin/env node
 /**
- * IOTA Sheets MCP Server.
+ * MCP сервер для IOTA-проекта.
  *
- * Provides generic Google Sheets operations + Discord integration
- * for the IOTA finance tracking workflow.
+ * Предоставляет generic Google Sheets тулы + Discord-интеграцию.
+ * В сервере НЕТ никакого хардкода под конкретную структуру таблицы —
+ * только базовые API-операции.
  *
- * Tools:
- *   - iota_sheets_read      — read rows from any sheet
- *   - iota_sheets_append    — append a row to any sheet
- *   - iota_sheets_update    — update a single cell
- *   - iota_sheets_info      — list sheets + preview headers
- *   - iota_next_iteration   — get next iteration number for a project
- *   - iota_discord_read_finances — read messages from Discord #finances
+ * Тулы:
+ *   - sheets_read             — прочитать строки любого листа
+ *   - sheets_append           — дописать строку в любой лист
+ *   - sheets_update           — обновить одну ячейку
+ *   - sheets_info             — список листов, превью первых 3 строк
+ *   - discord_read_messages   — прочитать сообщения Discord-канала
  */
 
 import { Server } from "@modelcontextprotocol/sdk/server/index.js";
@@ -21,7 +21,7 @@ import {
   ListToolsRequestSchema,
 } from "@modelcontextprotocol/sdk/types.js";
 
-import { read, append, update, info, getNextIteration } from "./sheets.mjs";
+import { read, append, update, info, clear } from "./sheets.mjs";
 import { readFinancesChannel } from "./discord.mjs";
 
 // ───────────────────────────────────────────────────────────────────────────
@@ -30,28 +30,31 @@ import { readFinancesChannel } from "./discord.mjs";
 
 const tools = [
   {
-    name: "iota_sheets_read",
+    name: "sheets_read",
     description:
-      "Read rows from a Google Sheets tab. Can read a specific range or the last N rows.",
+      "Read rows from a Google Sheets tab. Can read a specific A1 range or the last N rows.",
     inputSchema: {
       type: "object",
       properties: {
-        sheet: { type: "string", description: "Sheet name, e.g. 'расходы', 'платежи', 'ддс', 'итерации'" },
-        range: { type: "string", description: "Optional A1 range within the sheet, e.g. 'B1:K100'. Defaults to full sheet." },
-        last_n: { type: "number", description: "If set, return only the last N rows (useful for checking recent entries)." },
+        sheet:  { type: "string", description: "Sheet name" },
+        range:  { type: "string", description: "Optional A1 range within the sheet, e.g. 'B1:K100'." },
+        last_n: { type: "number", description: "If set, return only the last N rows." },
       },
       required: ["sheet"],
     },
   },
   {
-    name: "iota_sheets_append",
+    name: "sheets_append",
     description:
-      "Append a single row to a Google Sheets tab. Pass the target column range and an array of cell values.",
+      "Append a single row to a Google Sheets tab. Pure append — no auto-fill, no duplicate detection. " +
+      "Pass the target A1 column range and a positional array of cell values. " +
+      "If you need auto-fill of derived columns (rate/period/USD) and duplicate detection, use the smart-append helper script instead: " +
+      "`node scripts/smart-append.mjs --sheet=<name> --values=<JSON>`.",
     inputSchema: {
       type: "object",
       properties: {
-        sheet: { type: "string", description: "Sheet name, e.g. 'расходы'" },
-        range: { type: "string", description: "Column range to append to, e.g. 'B:K' for расходы, 'A:K' for платежи, 'A:H' for ддс" },
+        sheet:  { type: "string", description: "Sheet name" },
+        range:  { type: "string", description: "Column range to append to, e.g. 'B:K'" },
         values: {
           type: "array",
           items: {},
@@ -62,45 +65,47 @@ const tools = [
     },
   },
   {
-    name: "iota_sheets_update",
+    name: "sheets_update",
     description: "Update a single cell in a Google Sheets tab.",
     inputSchema: {
       type: "object",
       properties: {
         sheet: { type: "string", description: "Sheet name" },
-        cell: { type: "string", description: "Cell address, e.g. 'C2230'" },
-        value: { description: "New value (string or number)" },
+        cell:  { type: "string", description: "Cell address, e.g. 'C2230'" },
+        value: { description: "New value (string, number, or formula starting with =)" },
+        raw:   { type: "boolean", description: "If true, uses RAW input mode (preserves literal text, no date/formula parsing). Use when Sheets reformats your dates to unwanted format." },
       },
       required: ["sheet", "cell", "value"],
     },
   },
   {
-    name: "iota_sheets_info",
-    description:
-      "Get spreadsheet metadata: list of all sheet names. Optionally preview the first 3 rows of a specific sheet.",
+    name: "sheets_clear",
+    description: "Clear values in a range (cells become empty, rows stay). Useful to erase bad data before re-writing.",
     inputSchema: {
       type: "object",
       properties: {
-        sheet: { type: "string", description: "Optional: sheet name to preview first 3 rows of." },
+        sheet: { type: "string", description: "Sheet name" },
+        range: { type: "string", description: "A1 range to clear, e.g. 'B2070:K2113'" },
+      },
+      required: ["sheet", "range"],
+    },
+  },
+  {
+    name: "sheets_info",
+    description:
+      "Get spreadsheet metadata: list of all sheet names. Optionally preview the first 3 rows of a specific sheet (useful for discovering headers/structure).",
+    inputSchema: {
+      type: "object",
+      properties: {
+        sheet: { type: "string", description: "Optional sheet name to preview first 3 rows." },
       },
     },
   },
   {
-    name: "iota_next_iteration",
+    name: "discord_read_messages",
     description:
-      "Get the next iteration number for a project. Reads the 'итерации' sheet, finds the highest existing number for the given project, and returns { lastNum, nextNum, nextId }.",
-    inputSchema: {
-      type: "object",
-      properties: {
-        project: { type: "string", description: "Project name, e.g. 'Granite', 'Takhir', 'EAI_Website'" },
-      },
-      required: ["project"],
-    },
-  },
-  {
-    name: "iota_discord_read_finances",
-    description:
-      "Read recent messages from the Discord #finances channel. Downloads image attachments to Reports/discord/ for visual inspection via Read tool.",
+      "Read recent messages from the Discord channel (channel ID configured in .env). " +
+      "Downloads image attachments to reports/discord/ for visual inspection via Read.",
     inputSchema: {
       type: "object",
       properties: {
@@ -116,12 +121,12 @@ const tools = [
 // ───────────────────────────────────────────────────────────────────────────
 
 const handlers = {
-  iota_sheets_read: (a) => read(a.sheet, a.range, a.last_n),
-  iota_sheets_append: (a) => append(a.sheet, a.range, a.values),
-  iota_sheets_update: (a) => update(a.sheet, a.cell, a.value),
-  iota_sheets_info: (a) => info(a?.sheet),
-  iota_next_iteration: (a) => getNextIteration(a.project),
-  iota_discord_read_finances: (a) => readFinancesChannel({ limit: a?.limit, after: a?.after }),
+  sheets_read:           (a) => read(a.sheet, a.range, a.last_n),
+  sheets_append:         (a) => append(a.sheet, a.range, a.values),
+  sheets_update:         (a) => update(a.sheet, a.cell, a.value, a?.raw),
+  sheets_clear:          (a) => clear(a.sheet, a.range),
+  sheets_info:           (a) => info(a?.sheet),
+  discord_read_messages: (a) => readFinancesChannel({ limit: a?.limit, after: a?.after }),
 };
 
 // ───────────────────────────────────────────────────────────────────────────
@@ -129,7 +134,7 @@ const handlers = {
 // ───────────────────────────────────────────────────────────────────────────
 
 const server = new Server(
-  { name: "iota-sheets", version: "1.0.0" },
+  { name: "sheets", version: "2.0.0" },
   { capabilities: { tools: {} } },
 );
 
@@ -151,4 +156,4 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
 
 const transport = new StdioServerTransport();
 await server.connect(transport);
-console.error("[iota-sheets-mcp] Server started, awaiting requests on stdio");
+console.error("[sheets-mcp] Server started, awaiting requests on stdio");

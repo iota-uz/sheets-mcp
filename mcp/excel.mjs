@@ -30,7 +30,7 @@ import { fileURLToPath } from "url";
 const xlsx = xlsxModule.default || xlsxModule;
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
-const PROJECT_ROOT = path.resolve(__dirname, "..", "..");
+const PROJECT_ROOT = path.resolve(__dirname, "..");
 
 // ───────────────────────────────────────────────────────────────────────────
 // Helpers

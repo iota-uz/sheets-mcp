@@ -15,7 +15,7 @@ import { fileURLToPath } from "url";
 import { loadEnv } from "./env.mjs";
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
-const PROJECT_ROOT = path.resolve(__dirname, "..", "..");
+const PROJECT_ROOT = path.resolve(__dirname, "..");
 const IMAGES_DIR = path.join(PROJECT_ROOT, "reports", "discord");
 
 const DISCORD_API = "https://discord.com/api/v10";

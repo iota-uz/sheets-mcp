@@ -1,0 +1,16 @@
+{
+  "name": "sheets-mcp",
+  "version": "2.0.0",
+  "description": "Generic Google Sheets MCP server with smart-append and reconcile helpers",
+  "type": "module",
+  "private": true,
+  "main": "mcp/server.mjs",
+  "scripts": {
+    "start": "node mcp/server.mjs"
+  },
+  "dependencies": {
+    "@modelcontextprotocol/sdk": "^1.0.4",
+    "googleapis": "^144.0.0",
+    "xlsx": "^0.18.5"
+  }
+}
