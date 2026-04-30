@@ -27,8 +27,7 @@ IOTA MCP/
 ├── scripts/          ← умные helper-скрипты (generic, header-driven)
 │   ├── smart-append.mjs  — append 1 строки с auto-fill + dup-check
 │   ├── batch-append.mjs  — batch-импорт N строк из JSON с retry
-│   ├── reconcile.mjs     — сверка баланса
-│   └── reauth.mjs        — обновить Google OAuth токен
+│   └── reconcile.mjs     — сверка баланса
 │
 └── .claude/skills/   ← Claude-скиллы (бизнес-логика в markdown)
     ├── balance-check/         — сверка баланса в конце месяца
