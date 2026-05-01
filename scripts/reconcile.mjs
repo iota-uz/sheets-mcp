@@ -16,7 +16,30 @@
  *   node scripts/reconcile.mjs --tolerance=5        # допуск $ для паттернов
  */
 
-import { read, info, toNumber } from "../mcp/sheets.mjs";
+import { getSpreadsheet, valuesGet } from "../mcp/sheets-client.mjs";
+
+// reconcile.mjs is a generic, schema-agnostic analyzer — it deliberately doesn't
+// use the typed Table API. These adapters preserve the old sheets.mjs shape it depends on.
+function toNumber(value) {
+  if (value == null || value === "") return "";
+  if (typeof value === "number") return value;
+  const cleaned = String(value).replace(/[\s$]/g, "").replace(",", ".");
+  const parsed = parseFloat(cleaned);
+  return Number.isNaN(parsed) ? value : parsed;
+}
+async function read(sheet) {
+  const range = `${quoteSheetName(sheet)}!A1:Z`;
+  const rows = await valuesGet(range, { valueRenderOption: "FORMATTED_VALUE" });
+  return { sheet, total: rows.length, rows };
+}
+async function info() {
+  const meta = await getSpreadsheet();
+  return { spreadsheetId: meta.spreadsheetId, sheets: meta.sheets.map(s => s.properties.title) };
+}
+function quoteSheetName(name) {
+  if (/^[A-Za-z_][A-Za-z0-9_]*$/.test(name)) return name;
+  return `'${name.replace(/'/g, "''")}'`;
+}
 
 // ─── Паттерны колонок (определяют роль колонки по заголовку) ─────────────
 const COL = {

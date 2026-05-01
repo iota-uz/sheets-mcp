@@ -9,7 +9,8 @@ auth/
 config.json
 
 # Local data (не коммитим выписки, скрины, датафайлы импортов)
-reports/
+reports/*
+!reports/.gitkeep
 
 # Claude Code — личные настройки и планы
 .claude/settings.local.json

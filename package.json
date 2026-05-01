@@ -1,7 +1,7 @@
 {
   "name": "sheets-mcp",
-  "version": "2.0.0",
-  "description": "Generic Google Sheets MCP server with smart-append and reconcile helpers",
+  "version": "3.0.0",
+  "description": "Typed schema-aware Google Sheets MCP server (sheets_describe + sheets_exec) for IOTA finances",
   "type": "module",
   "private": true,
   "main": "mcp/server.mjs",

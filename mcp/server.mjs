@@ -1,17 +1,16 @@
 #!/usr/bin/env node
 /**
- * MCP сервер для IOTA-проекта.
+ * Generic Google Sheets MCP server.
  *
- * Предоставляет generic Google Sheets тулы + Discord-интеграцию.
- * В сервере НЕТ никакого хардкода под конкретную структуру таблицы —
- * только базовые API-операции.
+ * The MCP exposes a typed but sheet-agnostic Sheet API — no hardcoded
+ * column names, no schema files. Records are keyed by the actual header
+ * text of the target sheet. Validation rules are pulled from in-sheet
+ * data validation set via setValidation().
  *
- * Тулы:
- *   - sheets_read             — прочитать строки любого листа
- *   - sheets_append           — дописать строку в любой лист
- *   - sheets_update           — обновить одну ячейку
- *   - sheets_info             — список листов, превью первых 3 строк
- *   - discord_read_messages   — прочитать сообщения Discord-канала
+ * Tools:
+ *   - sheets_describe         metadata + headers for a sheet
+ *   - sheets_exec             run JS scripts against the Sheet API
+ *   - discord_read_messages   #finances channel
  */
 
 import { Server } from "@modelcontextprotocol/sdk/server/index.js";
@@ -21,120 +20,136 @@ import {
   ListToolsRequestSchema,
 } from "@modelcontextprotocol/sdk/types.js";
 
-import { read, append, update, info, clear } from "./sheets.mjs";
+import { exec } from "./runner.mjs";
+import { sheet } from "./sheet.mjs";
+import { getSpreadsheet } from "./sheets-client.mjs";
 import { readFinancesChannel } from "./discord.mjs";
 
-// ───────────────────────────────────────────────────────────────────────────
-// Tool definitions
-// ───────────────────────────────────────────────────────────────────────────
+// ─── Tool definitions ──────────────────────────────────────────────────
+
+const SHEETS_LIB_DOC = `
+The \`sheets\` global exposes:
+
+  sheets.sheet(name, { headerRow?: 1 })   → Promise<Sheet>
+  sheets.spreadsheetId()                  → string
+
+Sheet API:
+  sheet.describe()                            → { sheet, sheetId, headerRow, rowCount, headers: [{index, letter, text}] }
+
+  sheet.insertMany(records, opts?)            → Promise<{ inserted, skipped, rows }>
+        records: Array<{ "Header": value | "=formula" }>
+        opts:    { idempotencyKey?: (record, i) => string,
+                   format?: StyleObject, dryRun?: boolean }
+        ALL records compile to ONE batchUpdate (insertDimension + updateCells +
+        per-row idempotency tokens). Use this for batches — it's ~N× faster
+        than a loop of insert().
+
+  sheet.insert(record, opts?)                 → Promise<{ row, inserted, idempotencyHit }>
+        Sugar over insertMany for one record.
+        opts: { idempotencyKey?: string, format?: StyleObject, dryRun?: boolean }
+
+        Formula values use {row} and {col:HeaderName} placeholders.
+        Validation runs against in-sheet data validation rules (configure via setValidation).
+
+  sheet.find(where)                           → Promise<Array<{ row, "Header": value, ... }>>
+
+  sheet.update({ where?, rows?, set })        → Promise<{ updated, rows }>
+        Pass \`rows: [123, 456]\` to skip find() when you already know the rows.
+  sheet.delete({ where?, rows? })             → Promise<{ deleted, rows }>
+  sheet.format({ where?, rows?, set })        → Promise<{ formatted, rows }>
+
+  sheet.setValidation(header, spec)           → set ONE_OF_LIST validation on a column
+        spec: { type: "ONE_OF_LIST", values: string[], strict?: boolean }
+
+StyleObject keys:
+  backgroundColor: "#hex" | "red" | {red,green,blue}
+  horizontalAlignment: "LEFT" | "CENTER" | "RIGHT"
+  numberFormat: "DD.MM.YYYY" | "#,##0.00" | "[$$-409]#,##0.00" | { type, pattern }
+  textFormat: { bold, italic, fontSize, foregroundColor }
+  wrapStrategy: "WRAP" | "OVERFLOW_CELL" | "CLIP"
+
+Records use the sheet's actual header text — no role/schema indirection.
+The MCP itself has no knowledge of any specific spreadsheet structure;
+sheet-specific knowledge (column lists, categorization rules, formula
+templates) lives in CLAUDE.md / SKILL.md.
+
+Use sheets_describe to see headers and sheet metadata before writing scripts.
+`.trim();
 
 const tools = [
   {
-    name: "sheets_read",
+    name: "sheets_describe",
     description:
-      "Read rows from a Google Sheets tab. Can read a specific A1 range or the last N rows.",
+      "Describe a Google Sheet — return its sheetId, header row, row count, " +
+      "and the actual header texts with their column indices/letters. With no " +
+      "argument, lists all sheets in the spreadsheet.",
     inputSchema: {
       type: "object",
       properties: {
-        sheet:  { type: "string", description: "Sheet name" },
-        range:  { type: "string", description: "Optional A1 range within the sheet, e.g. 'B1:K100'." },
-        last_n: { type: "number", description: "If set, return only the last N rows." },
+        sheet: { type: "string", description: "Sheet name. Omit for spreadsheet-wide list of sheet titles." },
+        headerRow: { type: "number", description: "1-based row containing headers (default 1)." },
       },
-      required: ["sheet"],
     },
   },
   {
-    name: "sheets_append",
+    name: "sheets_exec",
     description:
-      "Append a single row to a Google Sheets tab. Pure append — no auto-fill, no duplicate detection. " +
-      "Pass the target A1 column range and a positional array of cell values. " +
-      "If you need auto-fill of derived columns (rate/period/USD) and duplicate detection, use the smart-append helper script instead: " +
-      "`node scripts/smart-append.mjs --sheet=<name> --values=<JSON>`.",
+      "Run JavaScript against the typed Sheet API.\n\n" + SHEETS_LIB_DOC + "\n\n" +
+      "Set dryRun: true to capture the planned batchUpdate request bodies without committing. " +
+      "The script is wrapped in `async () => { <your code> }` and awaited; whatever you `return` " +
+      "comes back as `result`. Console.log/info/warn/error are captured.",
     inputSchema: {
       type: "object",
       properties: {
-        sheet:  { type: "string", description: "Sheet name" },
-        range:  { type: "string", description: "Column range to append to, e.g. 'B:K'" },
-        values: {
-          type: "array",
-          items: {},
-          description: "Array of cell values for one row, in column order.",
-        },
+        code: { type: "string", description: "JS code to execute. Has access to `sheets`, `console`." },
+        dryRun: { type: "boolean", description: "If true, batchUpdate calls are recorded, not sent." },
+        timeoutMs: { type: "number", description: "Execution timeout in milliseconds (default 30000)." },
       },
-      required: ["sheet", "range", "values"],
-    },
-  },
-  {
-    name: "sheets_update",
-    description: "Update a single cell in a Google Sheets tab.",
-    inputSchema: {
-      type: "object",
-      properties: {
-        sheet: { type: "string", description: "Sheet name" },
-        cell:  { type: "string", description: "Cell address, e.g. 'C2230'" },
-        value: { description: "New value (string, number, or formula starting with =)" },
-        raw:   { type: "boolean", description: "If true, uses RAW input mode (preserves literal text, no date/formula parsing). Use when Sheets reformats your dates to unwanted format." },
-      },
-      required: ["sheet", "cell", "value"],
-    },
-  },
-  {
-    name: "sheets_clear",
-    description: "Clear values in a range (cells become empty, rows stay). Useful to erase bad data before re-writing.",
-    inputSchema: {
-      type: "object",
-      properties: {
-        sheet: { type: "string", description: "Sheet name" },
-        range: { type: "string", description: "A1 range to clear, e.g. 'B2070:K2113'" },
-      },
-      required: ["sheet", "range"],
-    },
-  },
-  {
-    name: "sheets_info",
-    description:
-      "Get spreadsheet metadata: list of all sheet names. Optionally preview the first 3 rows of a specific sheet (useful for discovering headers/structure).",
-    inputSchema: {
-      type: "object",
-      properties: {
-        sheet: { type: "string", description: "Optional sheet name to preview first 3 rows." },
-      },
+      required: ["code"],
     },
   },
   {
     name: "discord_read_messages",
     description:
-      "Read recent messages from the Discord channel (channel ID configured in .env). " +
+      "Read recent messages from the Discord #finances channel (configured via DISCORD_CHANNEL_ID). " +
       "Downloads image attachments to reports/discord/ for visual inspection via Read.",
     inputSchema: {
       type: "object",
       properties: {
-        limit: { type: "number", description: "Number of messages to fetch (default 10, max 100)" },
-        after: { type: "string", description: "Only fetch messages after this message ID (for pagination)." },
+        limit: { type: "number", description: "Number of messages to fetch (default 10, max 100)." },
+        after: { type: "string", description: "Only fetch messages after this message ID." },
       },
     },
   },
 ];
 
-// ───────────────────────────────────────────────────────────────────────────
-// Tool dispatch
-// ───────────────────────────────────────────────────────────────────────────
+// ─── Handlers ──────────────────────────────────────────────────────────
 
 const handlers = {
-  sheets_read:           (a) => read(a.sheet, a.range, a.last_n),
-  sheets_append:         (a) => append(a.sheet, a.range, a.values),
-  sheets_update:         (a) => update(a.sheet, a.cell, a.value, a?.raw),
-  sheets_clear:          (a) => clear(a.sheet, a.range),
-  sheets_info:           (a) => info(a?.sheet),
+  sheets_describe: async (a) => {
+    if (!a?.sheet) {
+      const meta = await getSpreadsheet();
+      return {
+        spreadsheetId: meta.spreadsheetId,
+        sheets: meta.sheets.map(s => ({ title: s.properties.title, sheetId: s.properties.sheetId })),
+      };
+    }
+    const s = await sheet(a.sheet, { headerRow: a.headerRow });
+    return s.describe();
+  },
+
+  sheets_exec: async (a) => {
+    if (typeof a?.code !== "string") throw new Error("`code` must be a string");
+    return exec(a.code, { dryRun: !!a.dryRun, timeoutMs: a.timeoutMs ?? 30000 });
+  },
+
   discord_read_messages: (a) => readFinancesChannel({ limit: a?.limit, after: a?.after }),
 };
 
-// ───────────────────────────────────────────────────────────────────────────
-// Server setup
-// ───────────────────────────────────────────────────────────────────────────
+// ─── Server bootstrap ──────────────────────────────────────────────────
 
 const server = new Server(
-  { name: "sheets", version: "2.0.0" },
+  { name: "sheets", version: "4.0.0" },
   { capabilities: { tools: {} } },
 );
 
@@ -150,10 +165,13 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
     const result = await handler(args ?? {});
     return { content: [{ type: "text", text: JSON.stringify(result, null, 2) }] };
   } catch (err) {
-    return { content: [{ type: "text", text: `ERROR: ${err.message}` }], isError: true };
+    return {
+      content: [{ type: "text", text: `ERROR: ${err.message}\n${err.stack ?? ""}` }],
+      isError: true,
+    };
   }
 });
 
 const transport = new StdioServerTransport();
 await server.connect(transport);
-console.error("[sheets-mcp] Server started, awaiting requests on stdio");
+console.error("[sheets-mcp] Server v4 started — generic Sheet API (sheets_describe + sheets_exec)");

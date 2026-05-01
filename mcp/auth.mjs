@@ -1,45 +1,44 @@
 /**
- * Google OAuth2 client loader.
+ * Google service account auth.
  *
- * Reads client credentials from environment variables (GOOGLE_CLIENT_ID,
- * GOOGLE_CLIENT_SECRET) and the refresh token from `auth/.gdrive-server-credentials.json`.
- *
- * Token refreshes are persisted back to disk automatically.
+ * Reads a service account JSON key from GOOGLE_SERVICE_ACCOUNT_KEY_PATH
+ * (defaults to auth/service-account.json) and returns a GoogleAuth client
+ * with Sheets + Drive scopes. JWT refresh is handled by googleapis.
  */
 
 import { google } from "googleapis";
-import fs from "fs";
 import path from "path";
+import fs from "fs";
 import { fileURLToPath } from "url";
 import { loadEnv } from "./env.mjs";
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const ROOT = path.resolve(__dirname, "..");
-const TOKEN_PATH = path.join(ROOT, "auth", ".gdrive-server-credentials.json");
 
-let cachedClient = null;
+const SCOPES = [
+  "https://www.googleapis.com/auth/spreadsheets",
+  "https://www.googleapis.com/auth/drive",
+];
 
-/**
- * Returns a memoized, authenticated Google OAuth2 client.
- */
+let cached = null;
+
 export function loadAuth() {
-  if (cachedClient) return cachedClient;
+  if (cached) return cached;
 
   const env = loadEnv();
-  const tokens = JSON.parse(fs.readFileSync(TOKEN_PATH, "utf-8"));
-
-  const client = new google.auth.OAuth2(
-    env.GOOGLE_CLIENT_ID,
-    env.GOOGLE_CLIENT_SECRET,
-    "http://localhost"
+  const keyPath = path.resolve(
+    ROOT,
+    env.GOOGLE_SERVICE_ACCOUNT_KEY_PATH || "auth/service-account.json"
   );
-  client.setCredentials(tokens);
 
-  client.on("tokens", (newTokens) => {
-    const merged = { ...tokens, ...newTokens };
-    fs.writeFileSync(TOKEN_PATH, JSON.stringify(merged, null, 2));
-  });
+  if (!fs.existsSync(keyPath)) {
+    throw new Error(
+      `Service account key not found at ${keyPath}. ` +
+        `Download a JSON key from GCP IAM and save it there, ` +
+        `or set GOOGLE_SERVICE_ACCOUNT_KEY_PATH in .env.`
+    );
+  }
 
-  cachedClient = client;
-  return cachedClient;
+  cached = new google.auth.GoogleAuth({ keyFile: keyPath, scopes: SCOPES });
+  return cached;
 }
