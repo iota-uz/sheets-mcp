@@ -53,15 +53,25 @@ The `Sheet`:
 
 ```ts
 sheet.describe(): { sheet, sheetId, headerRow, rowCount, headers }
+
+sheet.insertMany(records, opts?): Promise<{ inserted, skipped, rows }>
+   records: Array<{ "Header text": value | "=formula" }>
+   opts:    { idempotencyKey?: (record, i) => string,
+              format?: StyleObject, dryRun?: boolean }
+   N records → ONE batchUpdate. Use this for any batch.
+
 sheet.insert(record, opts?): Promise<{ row, inserted, idempotencyHit }>
-   record: { "Header text": value | "=formula" }
-   opts:   { idempotencyKey?: string, format?: StyleObject, dryRun?: boolean }
+   Sugar over insertMany for one record.
+   opts: { idempotencyKey?: string, format?: StyleObject, dryRun?: boolean }
+
 sheet.find(where): Promise<Array<{ row, "Header": value, ... }>>
-sheet.update({ where, set }): Promise<{ updated, rows }>
-sheet.delete({ where }): Promise<{ deleted, rows }>
-sheet.format({ where, set }): Promise<{ formatted, rows }>
+sheet.update({ where?, rows?, set }): Promise<{ updated, rows }>
+sheet.delete({ where?, rows? }): Promise<{ deleted, rows }>
+sheet.format({ where?, rows?, set }): Promise<{ formatted, rows }>
 sheet.setValidation(header, { type, values, strict? }): Promise<{ ok }>
 ```
+
+Pass `rows: [123, 456]` to update/delete/format to skip the find() lookup when the row numbers are already known.
 
 **Records use the sheet's actual header text** — no role/schema indirection.
 

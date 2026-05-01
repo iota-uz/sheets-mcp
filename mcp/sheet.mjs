@@ -4,21 +4,24 @@
  * runtime), formulas use {row} and {col:Header} placeholders that the runner
  * resolves at write time.
  *
- * No schema files. No "role" concept. No hardcoded column names anywhere.
- * Sheet-specific knowledge (categorization rules, formula templates,
- * column lists) lives in CLAUDE.md / SKILL.md alongside the business logic.
- *
- * Validation: pulled from in-sheet data validation rules (setDataValidation).
- * The sheet itself is the source of truth for enums. Agents call
- * sheet.setValidation(...) to configure these.
+ * Optimization model:
+ *   - _init does ONE spreadsheets.get covering sheet metadata, headers row,
+ *     and probe row (for data validation rules).
+ *   - Idempotency map is bulk-fetched once per sheet handle (one
+ *     developerMetadata.search returning all tokens), looked up locally.
+ *   - _nextRow is cached on the instance and incremented locally after each
+ *     write. No round trip per insert.
+ *   - insertMany batches N records into a single batchUpdate
+ *     (insertDimension + updateCells with N rows + N idempotency tokens).
+ *   - update/delete/format accept an explicit `rows: [...]` to skip find().
  */
 
-import { compileStyle, colorToRgbFloat, colLetter } from "./schema.mjs";
+import { compileStyle, colLetter } from "./schema.mjs";
 import {
-  getSpreadsheet,
   batchUpdate,
-  valuesGet,
+  spreadsheetsGet,
   developerMetadataSearch,
+  valuesGet,
 } from "./sheets-client.mjs";
 
 const META_KEY_IDEMPOTENCY = "iota:idempotency";
@@ -26,8 +29,7 @@ const META_KEY_IDEMPOTENCY = "iota:idempotency";
 const sheetCache = new Map();
 
 /**
- * Get a Sheet handle. Cached per process; resolves the sheet metadata once
- * (sheetId, rowCount, headers) and rebinds on each script run via runner cache reset.
+ * Get a Sheet handle. Cached per process.
  */
 export async function sheet(name, opts = {}) {
   const cacheKey = `${name}|${opts.headerRow ?? 1}`;
@@ -49,73 +51,109 @@ class Sheet {
     this.sheetId = null;
     this.rowCount = 0;
     this.colCount = 0;
-    this.headers = [];           // row[headerRow] from the sheet (string[])
-    this.headerToIdx = new Map(); // exact match, lowercased, ё→е normalized
-    this._validations = null;     // lazy: column header → validation rule
+    this.headers = [];
+    this.headerToIdx = new Map();
+    this._validations = new Map();   // headerText (normalized) → { type, values, strict }
+    this._nextRowCache = null;        // 1-based; lazy
+    this._idempotencyMap = null;      // Map<key, row>; lazy
   }
 
+  /**
+   * Single-call init: pulls sheet metadata + header row values + probe row
+   * data validation in one spreadsheets.get round trip.
+   */
   async _init() {
-    const meta = await getSpreadsheet();
-    const sheetMeta = meta.sheets.find(
-      s => normHeader(s.properties.title) === normHeader(this.name)
-    );
-    if (!sheetMeta) {
-      throw new Error(`Sheet "${this.name}" not found in spreadsheet`);
-    }
-    this.sheetId = sheetMeta.properties.sheetId;
-    this.rowCount = sheetMeta.properties.gridProperties.rowCount;
-    this.colCount = sheetMeta.properties.gridProperties.columnCount;
+    const probeRow = this.headerRow + 1;
+    const ranges = [
+      `${quoteSheetName(this.name)}!${this.headerRow}:${this.headerRow}`,
+      `${quoteSheetName(this.name)}!${probeRow}:${probeRow}`,
+    ];
+    const fields =
+      "spreadsheetId," +
+      "sheets(" +
+        "properties(sheetId,title,gridProperties)," +
+        "data(startRow,startColumn,rowData(values(formattedValue,dataValidation)))" +
+      ")";
 
-    const range = `${quoteSheetName(this.name)}!${this.headerRow}:${this.headerRow}`;
-    const rows = await valuesGet(range, { valueRenderOption: "FORMATTED_VALUE" });
-    this.headers = rows[0] || [];
+    const meta = await spreadsheetsGet({ ranges, includeGridData: true, fields });
+
+    const sheetMeta = (meta.sheets || []).find(
+      s => normHeader(s.properties?.title) === normHeader(this.name)
+    );
+    if (!sheetMeta) throw new Error(`Sheet "${this.name}" not found in spreadsheet`);
+
+    this.sheetId = sheetMeta.properties.sheetId;
+    this.rowCount = sheetMeta.properties.gridProperties?.rowCount ?? 0;
+    this.colCount = sheetMeta.properties.gridProperties?.columnCount ?? 0;
+
+    const data = sheetMeta.data || [];
+    // data[0] = header row, data[1] = probe row (matches request order)
+    const headerCells = data[0]?.rowData?.[0]?.values || [];
+    const headerStartCol = data[0]?.startColumn ?? 0;
+    const probeCells = data[1]?.rowData?.[0]?.values || [];
+    const probeStartCol = data[1]?.startColumn ?? 0;
+
+    // Build headers array indexed by absolute column index
+    const maxIdx = Math.max(
+      headerStartCol + headerCells.length,
+      probeStartCol + probeCells.length,
+    );
+    this.headers = new Array(maxIdx).fill("");
+    for (let i = 0; i < headerCells.length; i++) {
+      this.headers[headerStartCol + i] = headerCells[i]?.formattedValue ?? "";
+    }
     this.headers.forEach((h, idx) => {
       const k = normHeader(h);
       if (k) this.headerToIdx.set(k, idx);
     });
+
+    // Build validations indexed by header text
+    for (let i = 0; i < probeCells.length; i++) {
+      const colIdx = probeStartCol + i;
+      const dv = probeCells[i]?.dataValidation;
+      if (!dv?.condition) continue;
+      const cond = dv.condition;
+      if (cond.type !== "ONE_OF_LIST") continue;
+      const headerText = this.headers[colIdx];
+      if (!headerText) continue;
+      this._validations.set(normHeader(headerText), {
+        type: "ONE_OF_LIST",
+        values: (cond.values || []).map(v => v.userEnteredValue),
+        strict: dv.strict ?? false,
+      });
+    }
   }
 
-  /**
-   * Public metadata for sheets_describe.
-   */
   describe() {
     return {
       sheet: this.name,
       sheetId: this.sheetId,
       headerRow: this.headerRow,
       rowCount: this.rowCount,
-      headers: this.headers.map((h, idx) => ({
-        index: idx,
-        letter: colLetter(idx),
-        text: h,
-      })),
+      headers: this.headers
+        .map((text, index) => ({ index, letter: colLetter(index), text }))
+        .filter(h => h.text !== ""),
     };
   }
 
-  /**
-   * Resolve a header text to a 0-based column index. Throws if not found.
-   * Uses normalized matching: trim + lowercase + ё→е, so "Счёт" and "Счет"
-   * resolve to the same column.
-   */
   _col(header) {
     const idx = this.headerToIdx.get(normHeader(header));
     if (idx == null) {
-      const known = [...this.headerToIdx.keys()].join(", ");
+      const known = this.headers.filter(Boolean).join(", ");
       throw new Error(`Unknown header "${header}". Known: ${known}`);
     }
     return idx;
   }
 
   /**
-   * Find the next empty row (1-based). Scans all known-header columns and
-   * picks the max last-filled row across them. A single column might be
-   * sparse (e.g., placeholder column A "Column 11" with no recent data),
-   * so we look at all of them to find the true table end.
+   * Get the next available row number (1-based). Lazily initialized from
+   * a single valuesGet, then incremented locally on each successful write.
    */
-  async _nextRow() {
-    if (this.headerToIdx.size === 0) throw new Error(`Sheet "${this.name}" has no headers`);
+  async _getNextRow() {
+    if (this._nextRowCache != null) return this._nextRowCache;
 
     const indices = [...this.headerToIdx.values()];
+    if (indices.length === 0) throw new Error(`Sheet "${this.name}" has no headers`);
     const minIdx = Math.min(...indices);
     const maxIdx = Math.max(...indices);
     const range = `${quoteSheetName(this.name)}!${colLetter(minIdx)}${this.headerRow + 1}:${colLetter(maxIdx)}`;
@@ -133,149 +171,223 @@ class Sheet {
         break;
       }
     }
-    return this.headerRow + lastFilledOffset + 1;
+    this._nextRowCache = this.headerRow + lastFilledOffset + 1;
+    return this._nextRowCache;
   }
 
   /**
-   * Lazy-load and cache data-validation rules on each column.
-   * Returns Map<headerText, { type, values, strict }>.
+   * Lazy-load the full idempotency token map for this sheet. One round trip,
+   * results stay cached for the lifetime of this Sheet handle.
    */
-  async _loadValidations() {
-    if (this._validations) return this._validations;
-    const result = new Map();
-
-    // Sample one row in the data area (first data row) for each column's validation.
-    // dataValidation is typically uniform across a column when set via setDataValidation,
-    // so checking one cell is enough. Header row is excluded.
-    const probeRow = this.headerRow + 1;
-    const meta = await fetchValidations(this.sheetId, probeRow);
-
-    for (const [headerText, idx] of this.headerToIdx) {
-      const cell = meta[idx];
-      if (!cell?.dataValidation?.condition) continue;
-      const cond = cell.dataValidation.condition;
-      if (cond.type === "ONE_OF_LIST") {
-        result.set(headerText, {
-          type: "ONE_OF_LIST",
-          values: (cond.values || []).map(v => v.userEnteredValue),
-          strict: cell.dataValidation.strict ?? false,
-        });
-      }
+  async _loadIdempotency() {
+    if (this._idempotencyMap) return this._idempotencyMap;
+    const matches = await developerMetadataSearch([
+      {
+        developerMetadataLookup: {
+          metadataKey: META_KEY_IDEMPOTENCY,
+        },
+      },
+    ]);
+    const map = new Map();
+    const prefix = `${this.name}:`;
+    for (const m of matches) {
+      const md = m.developerMetadata;
+      if (!md?.metadataValue?.startsWith(prefix)) continue;
+      const loc = md.location?.dimensionRange;
+      if (loc?.sheetId !== this.sheetId) continue;
+      const key = md.metadataValue.slice(prefix.length);
+      map.set(key, loc.startIndex + 1);
     }
-
-    this._validations = result;
-    return result;
+    this._idempotencyMap = map;
+    return map;
   }
 
-  /**
-   * Validate a record against in-sheet data validation rules (read from
-   * spreadsheets.get). Throws if any field violates a strict rule.
-   */
-  async _validate(record) {
-    const rules = await this._loadValidations();
-    const errors = [];
-
+  _validateRecord(record, errors) {
     for (const [header, value] of Object.entries(record)) {
-      // Resolve header (catches typos before we try to compile placeholders)
-      this._col(header);
-
-      // Skip formula values
+      this._col(header);  // throws on unknown header
       if (typeof value === "string" && value.startsWith("=")) continue;
 
-      const rule = rules.get(normHeader(header)) ?? rules.get(header);
-      if (!rule) continue;
-      if (rule.type !== "ONE_OF_LIST") continue;
+      const rule = this._validations.get(normHeader(header));
+      if (!rule || rule.type !== "ONE_OF_LIST") continue;
       if (!rule.values.includes(String(value))) {
-        const msg = `"${header}" value "${value}" not in allowed list [${rule.values.join(", ")}]`;
-        if (rule.strict) errors.push(msg);
+        if (rule.strict) {
+          errors.push(`"${header}" value "${value}" not in [${rule.values.join(", ")}]`);
+        }
       }
     }
+  }
 
+  /**
+   * Insert N records atomically. ONE batchUpdate covers all inserts and
+   * idempotency tokens. ~3 round trips total regardless of N (init done
+   * upstream; idempotency + nextRow + batchUpdate).
+   *
+   * records: Array<{ "Header": value | "=formula" }>
+   * opts:
+   *   idempotencyKey?: (record, index) => string   per-record key generator
+   *   format?: StyleObject                          applied to each new row
+   *   dryRun?: boolean
+   */
+  async insertMany(records, opts = {}) {
+    if (!Array.isArray(records)) throw new Error("insertMany expects an array");
+    if (records.length === 0) {
+      return { inserted: [], skipped: [], rows: [] };
+    }
+
+    // 1. Validate every record locally
+    const errors = [];
+    for (let i = 0; i < records.length; i++) {
+      const rec = records[i];
+      const before = errors.length;
+      this._validateRecord(rec, errors);
+      if (errors.length > before) errors[errors.length - 1] = `record[${i}]: ${errors[errors.length - 1]}`;
+    }
     if (errors.length > 0) {
       const e = new Error(`Validation failed: ${errors.join("; ")}`);
       e.errors = errors;
       throw e;
     }
-  }
 
-  /**
-   * Insert one record. Atomic: insertDimension + updateCells (with formulas
-   * referencing the new row's actual position) + optional idempotency
-   * DeveloperMetadata, all in one batchUpdate.
-   *
-   * record: { "Header text": value | "=formula" }
-   *   formulas may use {row} and {col:Header} placeholders, resolved here.
-   *
-   * opts:
-   *   idempotencyKey?: string — opaque agent-supplied dedup token
-   *   format?: StyleObject   — applied to the new row
-   *   dryRun?: boolean       — return planned requests without sending
-   */
-  async insert(record, opts = {}) {
-    await this._validate(record);
-
-    const idempotencyKey = opts.idempotencyKey ?? null;
-    if (idempotencyKey) {
-      const hit = await this._findByIdempotency(idempotencyKey);
-      if (hit != null) return { row: hit, idempotencyHit: hit, inserted: false };
+    // 2. Bulk idempotency check
+    const keyFn = opts.idempotencyKey;
+    const keys = new Array(records.length).fill(null);
+    let needIdemMap = false;
+    if (typeof keyFn === "function") {
+      for (let i = 0; i < records.length; i++) {
+        const k = keyFn(records[i], i);
+        keys[i] = k != null ? String(k) : null;
+        if (keys[i] != null) needIdemMap = true;
+      }
     }
 
-    const lastRow = await this._nextRow();
-    const targetRow = lastRow;
+    let idemMap = null;
+    if (needIdemMap) idemMap = await this._loadIdempotency();
 
-    const requests = this._buildInsertRequests({ targetRow, record, idempotencyKey, rowFormat: opts.format });
+    const skipped = [];
+    const toInsert = [];
+    for (let i = 0; i < records.length; i++) {
+      const key = keys[i];
+      if (key && idemMap.has(key)) {
+        skipped.push({ index: i, key, existingRow: idemMap.get(key) });
+      } else {
+        toInsert.push({ index: i, record: records[i], key });
+      }
+    }
+
+    if (toInsert.length === 0) {
+      return { inserted: [], skipped, rows: [] };
+    }
+
+    // 3. Compute target rows
+    const startRow = await this._getNextRow();
+    const rowFormat = opts.format;
+
+    const requests = this._buildBatchInsertRequests({ startRow, toInsert, rowFormat });
 
     if (opts.dryRun) {
-      return { row: targetRow, dryRun: true, requests, inserted: false };
+      return {
+        inserted: toInsert.map((t, i) => ({ index: t.index, row: startRow + i, key: t.key })),
+        skipped,
+        rows: toInsert.map((_, i) => startRow + i),
+        dryRun: true,
+        requests,
+      };
     }
 
     await batchUpdate(requests);
-    return { row: targetRow, idempotencyHit: null, inserted: true };
+
+    // 4. Update local caches
+    this._nextRowCache = startRow + toInsert.length;
+    if (idemMap) {
+      for (let i = 0; i < toInsert.length; i++) {
+        if (toInsert[i].key) idemMap.set(toInsert[i].key, startRow + i);
+      }
+    }
+
+    return {
+      inserted: toInsert.map((t, i) => ({ index: t.index, row: startRow + i, key: t.key })),
+      skipped,
+      rows: toInsert.map((_, i) => startRow + i),
+    };
   }
 
-  _buildInsertRequests({ targetRow, record, idempotencyKey, rowFormat }) {
+  /**
+   * Single-record insert. Sugar over insertMany.
+   */
+  async insert(record, opts = {}) {
+    const manyOpts = {
+      ...(opts.format && { format: opts.format }),
+      ...(opts.dryRun && { dryRun: opts.dryRun }),
+    };
+    if (opts.idempotencyKey != null) {
+      manyOpts.idempotencyKey = () => String(opts.idempotencyKey);
+    }
+    const result = await this.insertMany([record], manyOpts);
+    if (result.skipped.length > 0) {
+      return { row: result.skipped[0].existingRow, idempotencyHit: result.skipped[0].existingRow, inserted: false };
+    }
+    return { row: result.inserted[0].row, idempotencyHit: null, inserted: true, ...(opts.dryRun && { dryRun: true, requests: result.requests }) };
+  }
+
+  _buildBatchInsertRequests({ startRow, toInsert, rowFormat }) {
     const sheetId = this.sheetId;
-    const rowIndex = targetRow - 1;
+    const startIndex = startRow - 1;
+    const N = toInsert.length;
     const requests = [];
 
-    // 1. Insert the new row
+    // 1. Insert N empty rows starting at startIndex
     requests.push({
       insertDimension: {
-        range: { sheetId, dimension: "ROWS", startIndex: rowIndex, endIndex: rowIndex + 1 },
-        inheritFromBefore: rowIndex > this.headerRow,
+        range: {
+          sheetId,
+          dimension: "ROWS",
+          startIndex,
+          endIndex: startIndex + N,
+        },
+        inheritFromBefore: startIndex > this.headerRow,
       },
     });
 
-    // 2. Per-column cell values
+    // 2. Compute max column across all records
     let maxColIdx = 0;
-    const cellsByIdx = new Map();
-    for (const [header, value] of Object.entries(record)) {
-      const idx = this._col(header);
-      if (idx > maxColIdx) maxColIdx = idx;
-      cellsByIdx.set(idx, this._encodeValue(value, targetRow));
-    }
+    const perRecord = toInsert.map(({ record }) => {
+      const cellsByIdx = new Map();
+      for (const [header, value] of Object.entries(record)) {
+        const idx = this._col(header);
+        if (idx > maxColIdx) maxColIdx = idx;
+        cellsByIdx.set(idx, value);
+      }
+      return cellsByIdx;
+    });
 
-    const values = new Array(maxColIdx + 1).fill(null).map((_, i) =>
-      cellsByIdx.has(i) ? cellsByIdx.get(i) : { userEnteredValue: { stringValue: "" } }
-    );
+    // Build rows with cell values, encoding formulas with the actual target row
+    const rows = perRecord.map((cellsByIdx, i) => {
+      const targetRow = startRow + i;
+      const values = new Array(maxColIdx + 1).fill(null).map((_, colIdx) =>
+        cellsByIdx.has(colIdx)
+          ? this._encodeValue(cellsByIdx.get(colIdx), targetRow)
+          : { userEnteredValue: { stringValue: "" } }
+      );
+      return { values };
+    });
 
     requests.push({
       updateCells: {
-        start: { sheetId, rowIndex, columnIndex: 0 },
-        rows: [{ values }],
+        start: { sheetId, rowIndex: startIndex, columnIndex: 0 },
+        rows,
         fields: "userEnteredValue",
       },
     });
 
-    // 3. Optional row format
+    // 3. Optional row format (applied across all new rows in one repeatCell)
     if (rowFormat) {
       const { cellFormat, fields } = compileStyle(rowFormat);
       requests.push({
         repeatCell: {
           range: {
             sheetId,
-            startRowIndex: rowIndex,
-            endRowIndex: rowIndex + 1,
+            startRowIndex: startIndex,
+            endRowIndex: startIndex + N,
             startColumnIndex: 0,
             endColumnIndex: maxColIdx + 1,
           },
@@ -285,19 +397,21 @@ class Sheet {
       });
     }
 
-    // 4. Idempotency token via DeveloperMetadata on the row
-    if (idempotencyKey) {
+    // 4. Idempotency tokens for non-duplicate records that have a key
+    for (let i = 0; i < toInsert.length; i++) {
+      const key = toInsert[i].key;
+      if (!key) continue;
       requests.push({
         createDeveloperMetadata: {
           developerMetadata: {
             metadataKey: META_KEY_IDEMPOTENCY,
-            metadataValue: `${this.name}:${idempotencyKey}`,
+            metadataValue: `${this.name}:${key}`,
             location: {
               dimensionRange: {
                 sheetId,
                 dimension: "ROWS",
-                startIndex: rowIndex,
-                endIndex: rowIndex + 1,
+                startIndex: startIndex + i,
+                endIndex: startIndex + i + 1,
               },
             },
             visibility: "PROJECT",
@@ -313,12 +427,8 @@ class Sheet {
     if (value === null || value === undefined || value === "") {
       return { userEnteredValue: { stringValue: "" } };
     }
-    if (typeof value === "number") {
-      return { userEnteredValue: { numberValue: value } };
-    }
-    if (typeof value === "boolean") {
-      return { userEnteredValue: { boolValue: value } };
-    }
+    if (typeof value === "number") return { userEnteredValue: { numberValue: value } };
+    if (typeof value === "boolean") return { userEnteredValue: { boolValue: value } };
     const s = String(value);
     if (s.startsWith("=")) {
       return { userEnteredValue: { formulaValue: this._compilePlaceholders(s, targetRow) } };
@@ -326,52 +436,31 @@ class Sheet {
     return { userEnteredValue: { stringValue: s } };
   }
 
-  /**
-   * Resolve {row} and {col:Header} placeholders in a formula string.
-   */
   _compilePlaceholders(formula, targetRow) {
     return formula.replace(/\{(row|col:[^}]+)\}/g, (m, key) => {
       if (key === "row") return String(targetRow);
       if (key.startsWith("col:")) {
         const header = key.slice(4);
-        const idx = this._col(header);
-        return colLetter(idx);
+        return colLetter(this._col(header));
       }
       return m;
     });
   }
 
-  async _findByIdempotency(key) {
-    const matches = await developerMetadataSearch([
-      {
-        developerMetadataLookup: {
-          metadataKey: META_KEY_IDEMPOTENCY,
-          metadataValue: `${this.name}:${key}`,
-        },
-      },
-    ]);
-    for (const m of matches) {
-      const loc = m.developerMetadata?.location;
-      if (loc?.dimensionRange?.sheetId === this.sheetId) {
-        return loc.dimensionRange.startIndex + 1;
-      }
-    }
-    return null;
-  }
-
   /**
-   * Find rows matching a where-clause (subset of headers, exact match).
-   * Returns array of { row, "Header text": value, ... }.
+   * Find rows matching a where-clause. Reads the data area once.
+   *
+   * where: { "Header": value, "Header2": value }
    */
   async find(where = {}) {
     const range = `${quoteSheetName(this.name)}!A${this.headerRow + 1}:ZZ`;
     const rows = await valuesGet(range);
+    const filterEntries = Object.entries(where);
 
     const results = [];
     rows.forEach((row, i) => {
-      const record = this._rowToRecord(row);
       let match = true;
-      for (const [header, expected] of Object.entries(where)) {
+      for (const [header, expected] of filterEntries) {
         const idx = this._col(header);
         const actual = row[idx];
         if (actual !== expected && String(actual ?? "") !== String(expected ?? "")) {
@@ -379,14 +468,14 @@ class Sheet {
           break;
         }
       }
-      if (match) results.push({ row: this.headerRow + 1 + i, ...record });
+      if (match) results.push({ row: this.headerRow + 1 + i, ...this._rowToRecord(row) });
     });
     return results;
   }
 
   _rowToRecord(row) {
     const r = {};
-    for (const [headerKey, idx] of this.headerToIdx) {
+    for (const [, idx] of this.headerToIdx) {
       const original = this.headers[idx];
       r[original] = row[idx] ?? null;
     }
@@ -394,25 +483,43 @@ class Sheet {
   }
 
   /**
-   * Update cells in rows matching the where clause.
-   * `set` keys are header texts.
+   * Resolve { rows?, where? } to an array of 1-based row numbers.
+   * `rows` short-circuits find() — useful when the agent already knows the row.
    */
-  async update({ where, set }) {
-    await this._validate(set);
-    const matches = await this.find(where);
-    if (matches.length === 0) return { updated: 0 };
+  async _resolveRows({ rows, where }) {
+    if (rows != null) {
+      const arr = Array.isArray(rows) ? rows : [rows];
+      return arr.map(r => Number(r));
+    }
+    if (where != null) {
+      const matches = await this.find(where);
+      return matches.map(m => m.row);
+    }
+    throw new Error("Provide either `rows` or `where`");
+  }
 
-    const sheetId = this.sheetId;
+  /**
+   * Update cells in selected rows.
+   *
+   * { where, set } | { rows, set }
+   */
+  async update({ where, rows, set }) {
+    const errors = [];
+    this._validateRecord(set ?? {}, errors);
+    if (errors.length > 0) throw new Error(`Validation failed: ${errors.join("; ")}`);
+
+    const targetRows = await this._resolveRows({ rows, where });
+    if (targetRows.length === 0) return { updated: 0, rows: [] };
+
     const requests = [];
-
-    for (const m of matches) {
-      const rowIndex = m.row - 1;
+    for (const row of targetRows) {
+      const rowIndex = row - 1;
       for (const [header, value] of Object.entries(set)) {
         const idx = this._col(header);
-        const cell = this._encodeValue(value, m.row);
+        const cell = this._encodeValue(value, row);
         requests.push({
           updateCells: {
-            start: { sheetId, rowIndex, columnIndex: idx },
+            start: { sheetId: this.sheetId, rowIndex, columnIndex: idx },
             rows: [{ values: [cell] }],
             fields: "userEnteredValue",
           },
@@ -420,42 +527,50 @@ class Sheet {
       }
     }
 
-    if (requests.length === 0) return { updated: 0 };
+    if (requests.length === 0) return { updated: 0, rows: [] };
     await batchUpdate(requests);
-    return { updated: matches.length, rows: matches.map(m => m.row) };
+    return { updated: targetRows.length, rows: targetRows };
   }
 
   /**
-   * Delete rows matching the where clause (deleteDimension).
+   * Delete selected rows (deleteDimension).
+   *
+   * { where } | { rows }
    */
-  async delete({ where }) {
-    const matches = await this.find(where);
-    if (matches.length === 0) return { deleted: 0 };
-    const sortedDesc = [...matches].sort((a, b) => b.row - a.row);
-    const requests = sortedDesc.map(m => ({
+  async delete({ where, rows }) {
+    const targetRows = await this._resolveRows({ rows, where });
+    if (targetRows.length === 0) return { deleted: 0, rows: [] };
+
+    const sortedDesc = [...targetRows].sort((a, b) => b - a);
+    const requests = sortedDesc.map(r => ({
       deleteDimension: {
-        range: { sheetId: this.sheetId, dimension: "ROWS", startIndex: m.row - 1, endIndex: m.row },
+        range: { sheetId: this.sheetId, dimension: "ROWS", startIndex: r - 1, endIndex: r },
       },
     }));
     await batchUpdate(requests);
-    return { deleted: matches.length, rows: matches.map(m => m.row) };
+
+    // Invalidate row-position-dependent caches
+    this._nextRowCache = null;
+    if (this._idempotencyMap) this._idempotencyMap = null;
+
+    return { deleted: targetRows.length, rows: targetRows };
   }
 
   /**
-   * Apply formatting to rows matching the where clause.
+   * Format selected rows.
    */
-  async format({ where, set }) {
-    const matches = await this.find(where);
-    if (matches.length === 0) return { formatted: 0 };
+  async format({ where, rows, set }) {
+    const targetRows = await this._resolveRows({ rows, where });
+    if (targetRows.length === 0) return { formatted: 0, rows: [] };
 
     const { cellFormat, fields } = compileStyle(set);
     const maxColIdx = Math.max(...this.headerToIdx.values());
-    const requests = matches.map(m => ({
+    const requests = targetRows.map(r => ({
       repeatCell: {
         range: {
           sheetId: this.sheetId,
-          startRowIndex: m.row - 1,
-          endRowIndex: m.row,
+          startRowIndex: r - 1,
+          endRowIndex: r,
           startColumnIndex: 0,
           endColumnIndex: maxColIdx + 1,
         },
@@ -464,13 +579,11 @@ class Sheet {
       },
     }));
     await batchUpdate(requests);
-    return { formatted: matches.length, rows: matches.map(m => m.row) };
+    return { formatted: targetRows.length, rows: targetRows };
   }
 
   /**
-   * Set data validation on a column. After this, future inserts/updates that
-   * pass an invalid value will be rejected pre-flight.
-   *
+   * Set data validation on a column.
    * spec: { type: "ONE_OF_LIST", values: string[], strict?: boolean }
    */
   async setValidation(header, spec) {
@@ -482,7 +595,7 @@ class Sheet {
       setDataValidation: {
         range: {
           sheetId: this.sheetId,
-          startRowIndex: this.headerRow,  // exclude header row
+          startRowIndex: this.headerRow,
           startColumnIndex: idx,
           endColumnIndex: idx + 1,
         },
@@ -497,33 +610,15 @@ class Sheet {
       },
     }];
     await batchUpdate(requests);
-    this._validations = null;  // bust cache
+
+    // Update local cache
+    this._validations.set(normHeader(header), {
+      type: "ONE_OF_LIST",
+      values: spec.values.map(v => String(v)),
+      strict: spec.strict ?? false,
+    });
     return { ok: true };
   }
-}
-
-/**
- * Helper: read data validation rules for a single probe row.
- * Returns Array<CellData> aligned with column index.
- */
-async function fetchValidations(sheetId, probeRow) {
-  // Use spreadsheets.get with grid-data filtered to that row + dataValidation field.
-  // Done via a low-level call so we don't pull all values.
-  const { google } = await import("googleapis");
-  const { loadAuth } = await import("./auth.mjs");
-  const { loadEnv } = await import("./env.mjs");
-  const env = loadEnv();
-  const auth = loadAuth();
-  const sheetsApi = google.sheets({ version: "v4", auth });
-  const res = await sheetsApi.spreadsheets.get({
-    spreadsheetId: env.SPREADSHEET_ID,
-    fields: `sheets(properties(sheetId),data(startRow,startColumn,rowData(values(dataValidation))))`,
-    ranges: [`${probeRow}:${probeRow}`],
-  });
-  const sheet = (res.data.sheets || []).find(s => s.properties?.sheetId === sheetId);
-  if (!sheet) return [];
-  const rowData = sheet.data?.[0]?.rowData?.[0]?.values || [];
-  return rowData;
 }
 
 function normHeader(s) {

@@ -73,29 +73,13 @@ return last.slice(-5);  // последние 5 для анализа точки
 const расходы = await sheets.sheet("расходы");
 const account = "Tenge Mastercard";  // или "Uzum Visa UZS"
 
-// Готовая formula для курса (placeholders резолвятся в runtime).
-// USD/SOM/EUR/RUB ветки покрывают все валюты, что встречаются в выписках.
 const RATE_FORMULA = '=SWITCH({col:Валюта}{row}; "USD";1; "SOM";IFERROR(INDEX(GOOGLEFINANCE("CURRENCY:USDUZS";"price";{col:Дата}{row});2;2);INDEX(GOOGLEFINANCE("CURRENCY:USDUZS";"price";WORKDAY({col:Дата}{row};-1));2;2)); "EUR";IFERROR(INDEX(GOOGLEFINANCE("CURRENCY:USDEUR";"price";{col:Дата}{row});2;2);INDEX(GOOGLEFINANCE("CURRENCY:USDEUR";"price";WORKDAY({col:Дата}{row};-1));2;2)); "RUB";IFERROR(INDEX(GOOGLEFINANCE("CURRENCY:USDRUB";"price";{col:Дата}{row});2;2);INDEX(GOOGLEFINANCE("CURRENCY:USDRUB";"price";WORKDAY({col:Дата}{row};-1));2;2)); NA())';
 const USD_FORMULA = '={col:Сумма}{row}/{col:Курс}{row}';
 
-function firstOfMonth(ddmmyyyy) {
+const firstOfMonth = (ddmmyyyy) => {
   const [, mm, yyyy] = ddmmyyyy.split(".");
   return `01.${mm}.${yyyy}`;
-}
-
-function recordFor(item) {
-  return {
-    "Дата": item.date,
-    "Категория": item.category,
-    "Сумма": item.amount,
-    "Курс": RATE_FORMULA,
-    "Валюта": item.currency,
-    "Сумма ($)": USD_FORMULA,
-    "Расчетный период": firstOfMonth(item.date),
-    "Исходящий счет": account,
-    "Описание": item.description,
-  };
-}
+};
 
 const items = [
   { date: "29.04.2026", category: "Сервера и подписки", amount: 53, currency: "USD", description: "Webflow" },
@@ -103,19 +87,25 @@ const items = [
   // ...
 ];
 
-const results = [];
-for (const item of items) {
-  const idempotencyKey = `${item.date}|${item.amount}|${item.category}|${item.description}`;
-  results.push(await расходы.insert(recordFor(item), { idempotencyKey }));
-}
-return {
-  inserted: results.filter(r => r.inserted).length,
-  skipped:  results.filter(r => r.idempotencyHit).length,
-  rows: results.map(r => r.row),
-};
+const records = items.map(item => ({
+  "Дата": item.date,
+  "Категория": item.category,
+  "Сумма": item.amount,
+  "Курс": RATE_FORMULA,
+  "Валюта": item.currency,
+  "Сумма ($)": USD_FORMULA,
+  "Расчетный период": firstOfMonth(item.date),
+  "Исходящий счет": account,
+  "Описание": item.description,
+}));
+
+// Один MCP-вызов, один atomic batchUpdate, один round trip к Sheets API
+return расходы.insertMany(records, {
+  idempotencyKey: (r, i) => `${items[i].date}|${items[i].amount}|${items[i].category}|${items[i].description}`,
+});
 ```
 
-Idempotency dedup — повторный запуск с тем же ключом возвращает `idempotencyHit` без дубля. Ключ собираешь из чего хочешь — главное чтобы был уникальным для каждого расхода.
+`insertMany` гораздо быстрее чем цикл `insert`'ов: 15 записей = 1 batchUpdate (вместо 15). Дедуп через бар-тест idempotency-токенов перед записью; повторный запуск возвращает `skipped[]` без дубля.
 
 ### Шаг 6 — обновить балансы
 

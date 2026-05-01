@@ -35,6 +35,20 @@ export async function getSpreadsheet({ includeGridData = false } = {}) {
   return res.data;
 }
 
+/**
+ * Lower-level spreadsheets.get with full control over ranges + fields.
+ * Used by Sheet._init to fetch sheet metadata + header/probe rows in one call.
+ */
+export async function spreadsheetsGet({ ranges, includeGridData = false, fields } = {}) {
+  const { sheets, spreadsheetId } = getClient();
+  const params = { spreadsheetId };
+  if (ranges) params.ranges = ranges;
+  if (includeGridData) params.includeGridData = includeGridData;
+  if (fields) params.fields = fields;
+  const res = await sheets.spreadsheets.get(params);
+  return res.data;
+}
+
 // Dry-run capture: when set, batchUpdate records the request body and returns a
 // synthetic response instead of calling the API. Toggled by the runner.
 let dryRunCapture = null;

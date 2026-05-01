@@ -34,18 +34,31 @@ The \`sheets\` global exposes:
   sheets.spreadsheetId()                  → string
 
 Sheet API:
-  sheet.describe()                        → { sheet, sheetId, headerRow, rowCount, headers: [{index, letter, text}] }
-  sheet.insert(record, opts?)             → Promise<{ row, inserted, idempotencyHit }>
-        record: { "Header text": value | "=formula" }
-        opts:   { idempotencyKey?: string, format?: StyleObject, dryRun?: boolean }
-        Atomic — insertDimension + updateCells + idempotency tag in one batchUpdate.
-        Formula values can use {row} and {col:HeaderName} placeholders.
-        Validation runs against in-sheet data validation rules; configure with setValidation.
-  sheet.find(where)                       → Promise<Array<{ row, "Header": value, ... }>>
-  sheet.update({ where, set })            → Promise<{ updated, rows }>
-  sheet.delete({ where })                 → Promise<{ deleted, rows }>
-  sheet.format({ where, set })            → Promise<{ formatted, rows }>
-  sheet.setValidation(header, spec)       → set ONE_OF_LIST validation on a column
+  sheet.describe()                            → { sheet, sheetId, headerRow, rowCount, headers: [{index, letter, text}] }
+
+  sheet.insertMany(records, opts?)            → Promise<{ inserted, skipped, rows }>
+        records: Array<{ "Header": value | "=formula" }>
+        opts:    { idempotencyKey?: (record, i) => string,
+                   format?: StyleObject, dryRun?: boolean }
+        ALL records compile to ONE batchUpdate (insertDimension + updateCells +
+        per-row idempotency tokens). Use this for batches — it's ~N× faster
+        than a loop of insert().
+
+  sheet.insert(record, opts?)                 → Promise<{ row, inserted, idempotencyHit }>
+        Sugar over insertMany for one record.
+        opts: { idempotencyKey?: string, format?: StyleObject, dryRun?: boolean }
+
+        Formula values use {row} and {col:HeaderName} placeholders.
+        Validation runs against in-sheet data validation rules (configure via setValidation).
+
+  sheet.find(where)                           → Promise<Array<{ row, "Header": value, ... }>>
+
+  sheet.update({ where?, rows?, set })        → Promise<{ updated, rows }>
+        Pass `rows: [123, 456]` to skip find() when you already know the rows.
+  sheet.delete({ where?, rows? })             → Promise<{ deleted, rows }>
+  sheet.format({ where?, rows?, set })        → Promise<{ formatted, rows }>
+
+  sheet.setValidation(header, spec)           → set ONE_OF_LIST validation on a column
         spec: { type: "ONE_OF_LIST", values: string[], strict?: boolean }
 
 StyleObject keys:
