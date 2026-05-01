@@ -1,0 +1,55 @@
+{
+  "$schema": "../mcp/schema-spec.md",
+  "sheet": "счета",
+  "headerRow": 2,
+  "primaryKey": ["name"],
+  "columns": {
+    "name": {
+      "header": "Краткое название",
+      "type": "string"
+    },
+    "amount": {
+      "header": "Сумма",
+      "type": "number",
+      "numberFormat": "#,##0.00",
+      "horizontalAlignment": "RIGHT"
+    },
+    "currency": {
+      "header": "Валюта",
+      "type": "enum",
+      "values": ["USD", "SOM", "EUR", "RUB"],
+      "validation": "strict"
+    },
+    "usdBalance": {
+      "header": "USD баланс",
+      "type": "formula",
+      "formula": "=IFERROR({amount}{row} / SWITCH({currency}{row}; \"USD\"; 1; \"SOM\"; INDEX(GOOGLEFINANCE(\"CURRENCY:USDUZS\"; \"price\"); 2; 2); \"RUB\"; INDEX(GOOGLEFINANCE(\"CURRENCY:USDRUB\"; \"price\"); 2; 2); \"EUR\"; INDEX(GOOGLEFINANCE(\"CURRENCY:USDEUR\"; \"price\"); 2; 2); NA()); 0)",
+      "numberFormat": "[$$-409]#,##0.00",
+      "horizontalAlignment": "RIGHT"
+    },
+    "type": {
+      "header": "Тип",
+      "type": "enum",
+      "values": ["Р/С", "Пластиковая карта", "Наличные", "Крипта"],
+      "validation": "strict"
+    },
+    "accountNumber": {
+      "header": "Номер счета",
+      "type": "string",
+      "optional": true
+    },
+    "description": {
+      "header": "Описание",
+      "type": "string",
+      "optional": true
+    }
+  },
+  "sheetProperties": {
+    "frozenRows": 2,
+    "headerStyle": {
+      "textFormat": { "bold": true },
+      "backgroundColor": "#e8eaed",
+      "horizontalAlignment": "CENTER"
+    }
+  }
+}

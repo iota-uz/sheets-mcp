@@ -1,0 +1,99 @@
+{
+  "$schema": "../mcp/schema-spec.md",
+  "sheet": "платежи",
+  "headerRow": 1,
+  "primaryKey": ["iteration", "amount", "date"],
+  "columns": {
+    "iteration": {
+      "header": "Итерация",
+      "type": "ref",
+      "refSheet": "итерации",
+      "refColumn": "id"
+    },
+    "project": {
+      "header": "Проект",
+      "type": "enum",
+      "values": [
+        "Granite",
+        "Takhir",
+        "EAI_Website",
+        "Reklama EAI",
+        "EAI_App",
+        "SHY ELD",
+        "Zender",
+        "Docpage",
+        "Helios",
+        "AI/ML"
+      ],
+      "validation": "warn"
+    },
+    "amount": {
+      "header": "Сумма",
+      "type": "number",
+      "numberFormat": "#,##0.00",
+      "horizontalAlignment": "RIGHT"
+    },
+    "category": {
+      "header": "Категория",
+      "type": "enum",
+      "values": [
+        "Разработка ПО под ключ",
+        "Поддержка и мелкие доработки",
+        "Консалтинг и продажа часов",
+        "Другие источники дохода"
+      ],
+      "validation": "warn"
+    },
+    "rate": {
+      "header": "Курс",
+      "type": "formula",
+      "formula": "=SWITCH({currency}{row}; \"USD\"; 1; \"SOM\"; IFERROR(INDEX(GOOGLEFINANCE(\"CURRENCY:USDUZS\"; \"price\"; {date}{row}); 2; 2); INDEX(GOOGLEFINANCE(\"CURRENCY:USDUZS\"; \"price\"; WORKDAY({date}{row}; -1)); 2; 2)); \"RUB\"; IFERROR(INDEX(GOOGLEFINANCE(\"CURRENCY:USDRUB\"; \"price\"; {date}{row}); 2; 2); INDEX(GOOGLEFINANCE(\"CURRENCY:USDRUB\"; \"price\"; WORKDAY({date}{row}; -1)); 2; 2)); \"EUR\"; IFERROR(INDEX(GOOGLEFINANCE(\"CURRENCY:USDEUR\"; \"price\"; {date}{row}); 2; 2); INDEX(GOOGLEFINANCE(\"CURRENCY:USDEUR\"; \"price\"; WORKDAY({date}{row}; -1)); 2; 2)); NA())",
+      "numberFormat": "#,##0.00"
+    },
+    "currency": {
+      "header": "Валюта",
+      "type": "enum",
+      "values": ["USD", "SOM", "EUR", "RUB"],
+      "validation": "strict"
+    },
+    "usdAmount": {
+      "header": "Сумма ($)",
+      "type": "formula",
+      "formula": "={amount}{row}/{rate}{row}",
+      "numberFormat": "[$$-409]#,##0.00",
+      "horizontalAlignment": "RIGHT"
+    },
+    "date": {
+      "header": "Дата",
+      "type": "date",
+      "numberFormat": "DD.MM.YYYY",
+      "horizontalAlignment": "RIGHT"
+    },
+    "period": {
+      "header": "Рассчетный период",
+      "type": "computed",
+      "compute": "firstOfMonth(date)",
+      "numberFormat": "DD.MM.YYYY"
+    },
+    "account": {
+      "header": "Входящий счет",
+      "type": "ref",
+      "refSheet": "счета",
+      "refColumn": "name",
+      "optional": true
+    },
+    "comment": {
+      "header": "Комментарий",
+      "type": "string",
+      "optional": true
+    }
+  },
+  "sheetProperties": {
+    "frozenRows": 1,
+    "headerStyle": {
+      "textFormat": { "bold": true },
+      "backgroundColor": "#e8eaed",
+      "horizontalAlignment": "CENTER"
+    }
+  }
+}

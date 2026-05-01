@@ -13,25 +13,52 @@ IOTA MCP/
 ├── .env.example      ← шаблон переменных окружения
 ├── .mcp.json         ← конфигурация MCP серверов
 ├── package.json
-├── reports/          ← сюда кидать выписки (.xlsx), скриншоты, JSON-датафайлы (gitignored)
-├── auth/             ← OAuth-токены (gitignored)
+├── reports/          ← сюда кидать выписки (.xlsx), скриншоты (gitignored)
+├── auth/             ← service account ключ (gitignored)
 │
-├── mcp/              ← MCP сервер (generic Google Sheets API)
-│   ├── server.mjs    — точка входа, регистрация tool'ов
-│   ├── sheets.mjs    — read/append/update/info/clear + toNumber
-│   ├── excel.mjs     — парсер xlsx-выписок
-│   ├── discord.mjs   — Discord REST API
-│   ├── env.mjs       — загрузка .env
-│   └── auth.mjs      — Google OAuth2
+├── schemas/          ← декларативные схемы листов (JSON)
+│   ├── расходы.json
+│   ├── платежи.json
+│   ├── итерации.json
+│   ├── ддс.json
+│   └── счета.json
 │
-├── scripts/          ← умные helper-скрипты (generic, header-driven)
-│   ├── smart-append.mjs  — append 1 строки с auto-fill + dup-check
-│   ├── batch-append.mjs  — batch-импорт N строк из JSON с retry
-│   └── reconcile.mjs     — сверка баланса
+├── mcp/              ← MCP сервер (typed schema-aware Sheets API)
+│   ├── server.mjs        — точка входа: sheets_describe + sheets_exec
+│   ├── runner.mjs        — sandbox для агентских JS-скриптов
+│   ├── table.mjs         — Table API (insert/find/update/format)
+│   ├── schema.mjs        — загрузчик схем + валидатор + style normalizer
+│   ├── sheets-client.mjs — низкоуровневый клиент Google Sheets API
+│   ├── excel.mjs         — парсер xlsx-выписок
+│   ├── discord.mjs       — Discord REST API
+│   ├── env.mjs           — загрузка .env
+│   └── auth.mjs          — Google service account
+│
+├── scripts/
+│   ├── bootstrap-schema.mjs  — однократная привязка ролей колонок через DeveloperMetadata
+│   └── reconcile.mjs         — сверка баланса
 │
 └── .claude/skills/   ← Claude-скиллы (бизнес-логика в markdown)
     ├── balance-check/         — сверка баланса в конце месяца
-    └── import-bank-statement/ — импорт банковской выписки
+    ├── import-bank-statement/ — импорт банковской выписки
+    └── import-card-transactions/ — импорт карточных расходов из мобильного банкинга
+```
+
+## MCP-инструменты
+
+| Tool | Что делает |
+|------|------------|
+| `sheets_describe` | Возвращает схему листа — роли колонок, типы, формулы, primary key. Вызывай перед написанием скрипта. |
+| `sheets_exec` | Выполняет JS-скрипт в песочнице с `sheets` API. Поддерживает `dryRun` (planned batchUpdate без записи). Один tool call = один скрипт = один атомарный batchUpdate. |
+| `discord_read_messages` | Читает сообщения Discord-канала (для скриптов "обработай дискорд"). |
+
+В `sheets_exec` доступно:
+```js
+const t = await sheets.table("расходы");
+await t.insert({ date, category, amount, currency, account, description }, { dryRun?, idempotencyKey?, format? });
+await t.find({ category: "ФОТ" });
+await t.update({ where: { row: 100 }, set: { account: "..." }});
+await t.format({ where: { ... }, set: { backgroundColor: "#ffe0e0" }});
 ```
 
 ---
@@ -47,7 +74,7 @@ IOTA MCP/
 | Колонка | Что записывать |
 |---------|---------------|
 | B — Дата | Дата платежа (ДД.ММ.ГГГГ) |
-| C — Категория | ФОТ / Налоги / Маркетинг и реклама / Аренда офис / Комиссия банка / Офисные припасы / Наемные рабоники вне штата / Другое |
+| C — Категория | ФОТ / Налоги / Маркетинг и реклама / EAI Google / Аренда офис / Комиссия банка / Офисные припасы / Наемные рабоники вне штата / Сервера и подписки / Другое |
 | D — Сумма | Сумма в исходной валюте |
 | E — Курс | *Считается автоматически* (Google Finance) |
 | F — Валюта | `USD` или `SOM` |
@@ -68,6 +95,7 @@ IOTA MCP/
 | **Наемные рабоники вне штата** | "бухгалтерские" |
 | **Налоги** | "обслуживание пассивных счетов", "пенсия", "НДФЛ", "импорт услуг", узб. налоговые термины |
 | **Комиссия банка** | "тариф", "SWIFT", "комиссия инобанка", "за документ S=" |
+| **Сервера и подписки** | SaaS-подписки и хостинг — см. раздел ниже про карты |
 | **Другое** | Всё, что не подошло под категории выше |
 
 ---
@@ -146,7 +174,7 @@ IOTA MCP/
 2. Классифицируем каждую по смыслу (LLM, не regex): кредит → платёж, "фин займ" → ддс, дебет → расход
 3. Для платежей — создаём новую итерацию (находим max номер по проекту, +1)
 4. Показываем dry-run → ждём подтверждения пользователя
-5. Пишем батчем через `scripts/batch-append.mjs` (auto-fill курса/периода/USD + dup-check)
+5. Пишем одним JS-скриптом через `sheets_exec` — `Table.insert` идемпотентен по primary key, формулы курса/USD автозаполняются из схемы.
 
 Детали правил классификации и порядка записи — в `SKILL.md` скилла.
 
@@ -201,5 +229,15 @@ node .claude/skills/reconcile-finances/scripts/reconcile.mjs --period=01.03.2026
 
 ## Запуск MCP сервера вручную (если не подключился)
 ```bash
-cd build && node src/mcp-server.mjs
+node mcp/server.mjs
 ```
+
+## Bootstrap новой схемы
+
+После добавления / изменения `schemas/<имя>.json`:
+```bash
+node scripts/bootstrap-schema.mjs <имя> --dry-run   # посмотреть план
+node scripts/bootstrap-schema.mjs <имя>             # применить
+node scripts/bootstrap-schema.mjs --all             # все схемы разом
+```
+Bootstrap записывает DeveloperMetadata (роли колонок), number formats, alignment, data validation, frozen rows, header style. Идемпотентен — пере-запуск пере-привязывает свежие настройки.
