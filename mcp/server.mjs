@@ -1,13 +1,16 @@
 #!/usr/bin/env node
 /**
- * MCP server for IOTA Finances spreadsheet automation.
+ * Generic Google Sheets MCP server.
  *
- * Two sheets-related tools (Playwright-style: agent writes scripts against
- * a typed Table API, runner executes them in a sandbox):
- *   - sheets_describe — return schema(s) for the spreadsheet
- *   - sheets_exec     — run JS using the `sheets` library
+ * The MCP exposes a typed but sheet-agnostic Sheet API — no hardcoded
+ * column names, no schema files. Records are keyed by the actual header
+ * text of the target sheet. Validation rules are pulled from in-sheet
+ * data validation set via setValidation().
  *
- * Plus Discord integration for the #finances channel.
+ * Tools:
+ *   - sheets_describe         metadata + headers for a sheet
+ *   - sheets_exec             run JS scripts against the Sheet API
+ *   - discord_read_messages   #finances channel
  */
 
 import { Server } from "@modelcontextprotocol/sdk/server/index.js";
@@ -18,8 +21,8 @@ import {
 } from "@modelcontextprotocol/sdk/types.js";
 
 import { exec } from "./runner.mjs";
-import { table } from "./table.mjs";
-import { listSchemas } from "./schema.mjs";
+import { sheet } from "./sheet.mjs";
+import { getSpreadsheet } from "./sheets-client.mjs";
 import { readFinancesChannel } from "./discord.mjs";
 
 // ─── Tool definitions ──────────────────────────────────────────────────
@@ -27,19 +30,23 @@ import { readFinancesChannel } from "./discord.mjs";
 const SHEETS_LIB_DOC = `
 The \`sheets\` global exposes:
 
-  sheets.table(name)              → Promise<Table>   (resolves schema + binds columns)
-  sheets.listSchemas()            → string[]
-  sheets.spreadsheetId()          → string
+  sheets.sheet(name, { headerRow?: 1 })   → Promise<Sheet>
+  sheets.spreadsheetId()                  → string
 
-Table API:
-  table.describe()                → schema info (columns, types, formulas, primary key)
-  table.insert(record, opts?)     → Promise<{ row, inserted, idempotencyHit? }>
-        opts: { idempotencyKey?: string, format?: StyleObject, dryRun?: boolean }
-        Atomic: insertDimension + updateCells + idempotency tag in one batchUpdate.
-        Computed/formula columns auto-filled — pass only literal fields.
-  table.find(where)               → Promise<Array<{row, ...record}>>
-  table.update({where, set})      → Promise<{updated, rows}>
-  table.format({where, set})      → Promise<{formatted, rows}>
+Sheet API:
+  sheet.describe()                        → { sheet, sheetId, headerRow, rowCount, headers: [{index, letter, text}] }
+  sheet.insert(record, opts?)             → Promise<{ row, inserted, idempotencyHit }>
+        record: { "Header text": value | "=formula" }
+        opts:   { idempotencyKey?: string, format?: StyleObject, dryRun?: boolean }
+        Atomic — insertDimension + updateCells + idempotency tag in one batchUpdate.
+        Formula values can use {row} and {col:HeaderName} placeholders.
+        Validation runs against in-sheet data validation rules; configure with setValidation.
+  sheet.find(where)                       → Promise<Array<{ row, "Header": value, ... }>>
+  sheet.update({ where, set })            → Promise<{ updated, rows }>
+  sheet.delete({ where })                 → Promise<{ deleted, rows }>
+  sheet.format({ where, set })            → Promise<{ formatted, rows }>
+  sheet.setValidation(header, spec)       → set ONE_OF_LIST validation on a column
+        spec: { type: "ONE_OF_LIST", values: string[], strict?: boolean }
 
 StyleObject keys:
   backgroundColor: "#hex" | "red" | {red,green,blue}
@@ -48,33 +55,36 @@ StyleObject keys:
   textFormat: { bold, italic, fontSize, foregroundColor }
   wrapStrategy: "WRAP" | "OVERFLOW_CELL" | "CLIP"
 
-Records use schema roles, not header text. E.g. for "расходы":
-  { date, category, amount, currency, account, description }
+Records use the sheet's actual header text — no role/schema indirection.
+The MCP itself has no knowledge of any specific spreadsheet structure;
+sheet-specific knowledge (column lists, categorization rules, formula
+templates) lives in CLAUDE.md / SKILL.md.
 
-Use sheets_describe to inspect a sheet's schema before writing scripts.
+Use sheets_describe to see headers and sheet metadata before writing scripts.
 `.trim();
 
 const tools = [
   {
     name: "sheets_describe",
     description:
-      "Describe one or all sheet schemas. Returns column roles, types, headers, " +
-      "formulas, primary key, and required vs optional fields. Call this before " +
-      "writing a sheets_exec script so you know what fields to pass.",
+      "Describe a Google Sheet — return its sheetId, header row, row count, " +
+      "and the actual header texts with their column indices/letters. With no " +
+      "argument, lists all sheets in the spreadsheet.",
     inputSchema: {
       type: "object",
       properties: {
-        sheet: { type: "string", description: "Sheet name. Omit for list of all schemas." },
+        sheet: { type: "string", description: "Sheet name. Omit for spreadsheet-wide list of sheet titles." },
+        headerRow: { type: "number", description: "1-based row containing headers (default 1)." },
       },
     },
   },
   {
     name: "sheets_exec",
     description:
-      "Run JavaScript against the typed Table API.\n\n" + SHEETS_LIB_DOC + "\n\n" +
-      "Set dryRun: true to capture the planned batchUpdate without committing. " +
-      "The script is wrapped in `async () => { <your code> }` and awaited; whatever " +
-      "you `return` comes back as `result`. Console.log/info/warn/error are captured.",
+      "Run JavaScript against the typed Sheet API.\n\n" + SHEETS_LIB_DOC + "\n\n" +
+      "Set dryRun: true to capture the planned batchUpdate request bodies without committing. " +
+      "The script is wrapped in `async () => { <your code> }` and awaited; whatever you `return` " +
+      "comes back as `result`. Console.log/info/warn/error are captured.",
     inputSchema: {
       type: "object",
       properties: {
@@ -104,21 +114,15 @@ const tools = [
 
 const handlers = {
   sheets_describe: async (a) => {
-    if (a?.sheet) {
-      const t = await table(a.sheet);
-      return t.describe();
+    if (!a?.sheet) {
+      const meta = await getSpreadsheet();
+      return {
+        spreadsheetId: meta.spreadsheetId,
+        sheets: meta.sheets.map(s => ({ title: s.properties.title, sheetId: s.properties.sheetId })),
+      };
     }
-    const names = listSchemas();
-    const all = {};
-    for (const name of names) {
-      try {
-        const t = await table(name);
-        all[name] = t.describe();
-      } catch (e) {
-        all[name] = { error: e.message };
-      }
-    }
-    return all;
+    const s = await sheet(a.sheet, { headerRow: a.headerRow });
+    return s.describe();
   },
 
   sheets_exec: async (a) => {
@@ -132,7 +136,7 @@ const handlers = {
 // ─── Server bootstrap ──────────────────────────────────────────────────
 
 const server = new Server(
-  { name: "sheets", version: "3.0.0" },
+  { name: "sheets", version: "4.0.0" },
   { capabilities: { tools: {} } },
 );
 
@@ -157,4 +161,4 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
 
 const transport = new StdioServerTransport();
 await server.connect(transport);
-console.error("[sheets-mcp] Server v3 started — sheets_describe + sheets_exec + discord_read_messages");
+console.error("[sheets-mcp] Server v4 started — generic Sheet API (sheets_describe + sheets_exec)");

@@ -19,8 +19,8 @@ allowed-tools: mcp__sheets__sheets_describe, mcp__sheets__sheets_exec, Read
 
 ```js
 // sheets_exec
-const расходы = await sheets.table("расходы");
-const last = await расходы.find({ account: "Tenge Mastercard" });  // or "Uzum Visa UZS"
+const расходы = await sheets.sheet("расходы");
+const last = await расходы.find({ "Исходящий счет": "Tenge Mastercard" });  // или "Uzum Visa UZS"
 return last.slice(-5);  // последние 5 для анализа точки отсчёта
 ```
 
@@ -70,18 +70,43 @@ return last.slice(-5);  // последние 5 для анализа точки
 Один скрипт через `sheets_exec` для всей пачки (один MCP вызов, один атомарный батч):
 
 ```js
-const расходы = await sheets.table("расходы");
+const расходы = await sheets.sheet("расходы");
 const account = "Tenge Mastercard";  // или "Uzum Visa UZS"
 
+// Готовая formula для курса (placeholders резолвятся в runtime).
+// USD/SOM/EUR/RUB ветки покрывают все валюты, что встречаются в выписках.
+const RATE_FORMULA = '=SWITCH({col:Валюта}{row}; "USD";1; "SOM";IFERROR(INDEX(GOOGLEFINANCE("CURRENCY:USDUZS";"price";{col:Дата}{row});2;2);INDEX(GOOGLEFINANCE("CURRENCY:USDUZS";"price";WORKDAY({col:Дата}{row};-1));2;2)); "EUR";IFERROR(INDEX(GOOGLEFINANCE("CURRENCY:USDEUR";"price";{col:Дата}{row});2;2);INDEX(GOOGLEFINANCE("CURRENCY:USDEUR";"price";WORKDAY({col:Дата}{row};-1));2;2)); "RUB";IFERROR(INDEX(GOOGLEFINANCE("CURRENCY:USDRUB";"price";{col:Дата}{row});2;2);INDEX(GOOGLEFINANCE("CURRENCY:USDRUB";"price";WORKDAY({col:Дата}{row};-1));2;2)); NA())';
+const USD_FORMULA = '={col:Сумма}{row}/{col:Курс}{row}';
+
+function firstOfMonth(ddmmyyyy) {
+  const [, mm, yyyy] = ddmmyyyy.split(".");
+  return `01.${mm}.${yyyy}`;
+}
+
+function recordFor(item) {
+  return {
+    "Дата": item.date,
+    "Категория": item.category,
+    "Сумма": item.amount,
+    "Курс": RATE_FORMULA,
+    "Валюта": item.currency,
+    "Сумма ($)": USD_FORMULA,
+    "Расчетный период": firstOfMonth(item.date),
+    "Исходящий счет": account,
+    "Описание": item.description,
+  };
+}
+
 const items = [
-  { date: "29.04.2026", category: "Сервера и подписки", amount: 53, currency: "USD", account, description: "Webflow" },
-  { date: "27.04.2026", category: "Сервера и подписки", amount: 48, currency: "USD", account, description: "OpenAI ChatGPT" },
+  { date: "29.04.2026", category: "Сервера и подписки", amount: 53, currency: "USD", description: "Webflow" },
+  { date: "27.04.2026", category: "Сервера и подписки", amount: 48, currency: "USD", description: "OpenAI ChatGPT" },
   // ...
 ];
 
 const results = [];
 for (const item of items) {
-  results.push(await расходы.insert(item));
+  const idempotencyKey = `${item.date}|${item.amount}|${item.category}|${item.description}`;
+  results.push(await расходы.insert(recordFor(item), { idempotencyKey }));
 }
 return {
   inserted: results.filter(r => r.inserted).length,
@@ -90,16 +115,16 @@ return {
 };
 ```
 
-Курс/USD/период заполняются автоматически из формул в схеме. Idempotency дедуп — по primary key (date+amount+category+description) через DeveloperMetadata, повторный запуск того же скрипта ничего не дублирует.
+Idempotency dedup — повторный запуск с тем же ключом возвращает `idempotencyHit` без дубля. Ключ собираешь из чего хочешь — главное чтобы был уникальным для каждого расхода.
 
 ### Шаг 6 — обновить балансы
 
 После всех вставок спросить у пользователя актуальные балансы карт (скрин "By products" в банковском приложении). Обновить через Table API:
 
 ```js
-const счета = await sheets.table("счета");
-await счета.update({ where: { name: "Tenge Mastercard" }, set: { amount: 795637.75 }});
-await счета.update({ where: { name: "Uzum Visa UZS" }, set: { amount: 30840294.87 }});
+const счета = await sheets.sheet("счета", { headerRow: 2 });
+await счета.update({ where: { "Краткое название": "Tenge Mastercard" }, set: { "Сумма": 795637.75 }});
+await счета.update({ where: { "Краткое название": "Uzum Visa UZS" },    set: { "Сумма": 30840294.87 }});
 ```
 
 Карты `**** 1305` и `**** 1148` (Kapitalbank) — личные, в листе `счета` их нет, пропускать.
