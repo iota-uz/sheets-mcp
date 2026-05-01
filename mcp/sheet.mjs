@@ -22,6 +22,7 @@ import {
   spreadsheetsGet,
   developerMetadataSearch,
   valuesGet,
+  valuesUpdate,
 } from "./sheets-client.mjs";
 
 const META_KEY_IDEMPOTENCY = "iota:idempotency";
@@ -618,6 +619,34 @@ class Sheet {
       strict: spec.strict ?? false,
     });
     return { ok: true };
+  }
+
+  /**
+   * Read a raw A1 range. Returns 2D array of values (formatted), or [] if empty.
+   * `valueRender`: "FORMATTED_VALUE" | "UNFORMATTED_VALUE" | "FORMULA".
+   */
+  async readRange(a1, { valueRender = "UNFORMATTED_VALUE" } = {}) {
+    const range = `${quoteSheetName(this.name)}!${a1}`;
+    return valuesGet(range, { valueRenderOption: valueRender });
+  }
+
+  /**
+   * Write a raw A1 range. `values` is a 2D array. By default values are parsed
+   * by Sheets (USER_ENTERED) so "=A1+B1" becomes a formula and "1.5" a number.
+   * Pass { raw: true } to write strings verbatim.
+   */
+  async writeRange(a1, values, { raw = false } = {}) {
+    if (!Array.isArray(values) || !Array.isArray(values[0])) {
+      throw new Error("writeRange: values must be a 2D array");
+    }
+    const range = `${quoteSheetName(this.name)}!${a1}`;
+    const res = await valuesUpdate(range, values, { raw });
+    return {
+      updatedRange: res.updatedRange,
+      updatedRows: res.updatedRows ?? 0,
+      updatedColumns: res.updatedColumns ?? 0,
+      updatedCells: res.updatedCells ?? 0,
+    };
   }
 }
 
