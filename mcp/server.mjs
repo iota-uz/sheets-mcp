@@ -54,7 +54,7 @@ Sheet API:
   sheet.find(where)                           → Promise<Array<{ row, "Header": value, ... }>>
 
   sheet.update({ where?, rows?, set })        → Promise<{ updated, rows }>
-        Pass `rows: [123, 456]` to skip find() when you already know the rows.
+        Pass \`rows: [123, 456]\` to skip find() when you already know the rows.
   sheet.delete({ where?, rows? })             → Promise<{ deleted, rows }>
   sheet.format({ where?, rows?, set })        → Promise<{ formatted, rows }>
 
