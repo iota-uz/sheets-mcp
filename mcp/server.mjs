@@ -61,6 +61,12 @@ Sheet API:
   sheet.setValidation(header, spec)           → set ONE_OF_LIST validation on a column
         spec: { type: "ONE_OF_LIST", values: string[], strict?: boolean }
 
+  sheet.readRange(a1, opts?)                  → Promise<any[][]>
+        Raw A1 read (e.g. "A2:B90"). opts.valueRender:
+        "UNFORMATTED_VALUE" (default) | "FORMATTED_VALUE" | "FORMULA".
+  sheet.writeRange(a1, values, opts?)         → Promise<{ updatedRange, updatedCells, ... }>
+        Raw A1 write of a 2D array. opts.raw=true to skip USER_ENTERED parsing.
+
 StyleObject keys:
   backgroundColor: "#hex" | "red" | {red,green,blue}
   horizontalAlignment: "LEFT" | "CENTER" | "RIGHT"
