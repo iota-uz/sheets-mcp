@@ -1,0 +1,11 @@
+{
+  "mcpServers": {
+    "sheets": {
+      "command": "node",
+      "args": ["mcp/server.mjs"],
+      "env": {
+        "GOOGLE_APPLICATION_CREDENTIALS": "${workspaceFolder}/auth/service-account.json"
+      }
+    }
+  }
+}

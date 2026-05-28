@@ -1,0 +1,39 @@
+# Dependencies
+node_modules/
+
+# Environment & secrets
+.env
+.env.*
+!.env.example
+auth/
+config.json
+
+# Local data (не коммитим выписки, скрины, датафайлы импортов)
+reports/*
+!reports/.gitkeep
+
+# Claude Code — личные настройки и планы
+.claude/settings.local.json
+.claude/plans/
+
+# OS metadata
+.DS_Store
+Thumbs.db
+desktop.ini
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# Logs
+*.log
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+
+# Temp files
+*.tmp
+*.temp
+*.bak

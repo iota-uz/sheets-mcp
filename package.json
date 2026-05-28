@@ -1,0 +1,42 @@
+{
+  "name": "@iota-uz/sheets-mcp",
+  "version": "0.1.0-rc.1",
+  "description": "Generic Model Context Protocol server for Google Sheets — typed sheet-agnostic API with atomic batch writes and idempotency.",
+  "type": "module",
+  "main": "mcp/server.mjs",
+  "bin": {
+    "sheets-mcp": "mcp/server.mjs"
+  },
+  "files": [
+    "mcp/",
+    "README.md",
+    "LICENSE"
+  ],
+  "engines": {
+    "node": ">=20"
+  },
+  "license": "Apache-2.0",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/iota-uz/sheets-mcp.git"
+  },
+  "publishConfig": {
+    "access": "public"
+  },
+  "keywords": [
+    "mcp",
+    "model-context-protocol",
+    "google-sheets",
+    "claude",
+    "claude-code",
+    "anthropic"
+  ],
+  "scripts": {
+    "start": "node mcp/server.mjs"
+  },
+  "dependencies": {
+    "@modelcontextprotocol/sdk": "^1.0.4",
+    "googleapis": "^144.0.0",
+    "xlsx": "^0.18.5"
+  }
+}
