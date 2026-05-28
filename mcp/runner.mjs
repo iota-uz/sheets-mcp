@@ -1,12 +1,9 @@
 /**
  * Script runner — executes agent-supplied JS against the generic Sheet API.
  *
- * Each call is a fresh evaluation in a vm context with only the `sheets`
- * library and a captured `console`. No fs, network (except via sheets), or
- * process access.
- *
- * The user code is wrapped in `async function() { ... }` and awaited; the
- * return value plus stdout/stderr come back as the result.
+ * Each call is bound to a specific spreadsheetId. The sandbox exposes
+ * `sheets.sheet(name, opts?)` and `sheets.spreadsheetId()` already bound,
+ * so agent scripts don't repeat the ID per call.
  *
  * dryRun: when true, batchUpdate calls go into a captured array instead of
  * being sent. The runner returns the captured request bodies.
@@ -14,16 +11,18 @@
 
 import vm from "vm";
 import { sheet as makeSheet, clearCache } from "./sheet.mjs";
-import { spreadsheetId as getSpreadsheetId, setDryRunMode } from "./sheets-client.mjs";
+import { setDryRunMode } from "./sheets-client.mjs";
 
-export async function exec(code, { dryRun = false, timeoutMs = 30000 } = {}) {
+export async function exec(spreadsheetId, code, { dryRun = false, timeoutMs = 30000 } = {}) {
+  if (!spreadsheetId) throw new Error("exec requires a spreadsheetId");
+
   const stdout = [];
   const stderr = [];
   const captured = { batchUpdates: [] };
 
   const sheets = {
-    sheet: makeSheet,
-    spreadsheetId: getSpreadsheetId,
+    sheet: (name, opts) => makeSheet(spreadsheetId, name, opts),
+    spreadsheetId: () => spreadsheetId,
   };
 
   const sandboxConsole = {

@@ -10,7 +10,7 @@
  * Tools:
  *   - sheets_describe         metadata + headers for a sheet
  *   - sheets_exec             run JS scripts against the Sheet API
- *   - discord_read_messages   #finances channel
+ *   - discord_read_messages   read a configured Discord channel
  */
 
 import { Server } from "@modelcontextprotocol/sdk/server/index.js";
@@ -25,10 +25,8 @@ import { sheet } from "./sheet.mjs";
 import { getSpreadsheet } from "./sheets-client.mjs";
 import { readFinancesChannel } from "./discord.mjs";
 
-// ─── Tool definitions ──────────────────────────────────────────────────
-
 const SHEETS_LIB_DOC = `
-The \`sheets\` global exposes:
+The \`sheets\` global is bound to the spreadsheetId you passed in:
 
   sheets.sheet(name, { headerRow?: 1 })   → Promise<Sheet>
   sheets.spreadsheetId()                  → string
@@ -77,7 +75,7 @@ StyleObject keys:
 Records use the sheet's actual header text — no role/schema indirection.
 The MCP itself has no knowledge of any specific spreadsheet structure;
 sheet-specific knowledge (column lists, categorization rules, formula
-templates) lives in CLAUDE.md / SKILL.md.
+templates) lives in the consumer's CLAUDE.md / SKILL.md.
 
 Use sheets_describe to see headers and sheet metadata before writing scripts.
 `.trim();
@@ -88,13 +86,15 @@ const tools = [
     description:
       "Describe a Google Sheet — return its sheetId, header row, row count, " +
       "and the actual header texts with their column indices/letters. With no " +
-      "argument, lists all sheets in the spreadsheet.",
+      "`sheet` argument, lists all sheets in the spreadsheet.",
     inputSchema: {
       type: "object",
       properties: {
+        spreadsheetId: { type: "string", description: "Target Google Sheets spreadsheet ID." },
         sheet: { type: "string", description: "Sheet name. Omit for spreadsheet-wide list of sheet titles." },
         headerRow: { type: "number", description: "1-based row containing headers (default 1)." },
       },
+      required: ["spreadsheetId"],
     },
   },
   {
@@ -107,17 +107,19 @@ const tools = [
     inputSchema: {
       type: "object",
       properties: {
+        spreadsheetId: { type: "string", description: "Target Google Sheets spreadsheet ID. Bound to the `sheets` global for this call." },
         code: { type: "string", description: "JS code to execute. Has access to `sheets`, `console`." },
         dryRun: { type: "boolean", description: "If true, batchUpdate calls are recorded, not sent." },
         timeoutMs: { type: "number", description: "Execution timeout in milliseconds (default 30000)." },
       },
-      required: ["code"],
+      required: ["spreadsheetId", "code"],
     },
   },
   {
     name: "discord_read_messages",
     description:
-      "Read recent messages from the Discord #finances channel (configured via DISCORD_CHANNEL_ID). " +
+      "Read recent messages from a Discord channel (channel + bot configured via " +
+      "DISCORD_BOT_TOKEN and DISCORD_CHANNEL_ID env vars). " +
       "Downloads image attachments to reports/discord/ for visual inspection via Read.",
     inputSchema: {
       type: "object",
@@ -129,30 +131,28 @@ const tools = [
   },
 ];
 
-// ─── Handlers ──────────────────────────────────────────────────────────
-
 const handlers = {
   sheets_describe: async (a) => {
+    if (!a?.spreadsheetId) throw new Error("`spreadsheetId` is required");
     if (!a?.sheet) {
-      const meta = await getSpreadsheet();
+      const meta = await getSpreadsheet(a.spreadsheetId);
       return {
         spreadsheetId: meta.spreadsheetId,
         sheets: meta.sheets.map(s => ({ title: s.properties.title, sheetId: s.properties.sheetId })),
       };
     }
-    const s = await sheet(a.sheet, { headerRow: a.headerRow });
+    const s = await sheet(a.spreadsheetId, a.sheet, { headerRow: a.headerRow });
     return s.describe();
   },
 
   sheets_exec: async (a) => {
+    if (!a?.spreadsheetId) throw new Error("`spreadsheetId` is required");
     if (typeof a?.code !== "string") throw new Error("`code` must be a string");
-    return exec(a.code, { dryRun: !!a.dryRun, timeoutMs: a.timeoutMs ?? 30000 });
+    return exec(a.spreadsheetId, a.code, { dryRun: !!a.dryRun, timeoutMs: a.timeoutMs ?? 30000 });
   },
 
   discord_read_messages: (a) => readFinancesChannel({ limit: a?.limit, after: a?.after }),
 };
-
-// ─── Server bootstrap ──────────────────────────────────────────────────
 
 const server = new Server(
   { name: "sheets", version: "4.0.0" },
