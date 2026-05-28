@@ -30,12 +30,12 @@ const META_KEY_IDEMPOTENCY = "iota:idempotency";
 const sheetCache = new Map();
 
 /**
- * Get a Sheet handle. Cached per process.
+ * Get a Sheet handle. Cached per (spreadsheetId, name, headerRow).
  */
-export async function sheet(name, opts = {}) {
-  const cacheKey = `${name}|${opts.headerRow ?? 1}`;
+export async function sheet(spreadsheetId, name, opts = {}) {
+  const cacheKey = `${spreadsheetId}|${name}|${opts.headerRow ?? 1}`;
   if (sheetCache.has(cacheKey)) return sheetCache.get(cacheKey);
-  const s = new Sheet(name, opts);
+  const s = new Sheet(spreadsheetId, name, opts);
   await s._init();
   sheetCache.set(cacheKey, s);
   return s;
@@ -46,7 +46,8 @@ export function clearCache() {
 }
 
 class Sheet {
-  constructor(name, { headerRow = 1 } = {}) {
+  constructor(spreadsheetId, name, { headerRow = 1 } = {}) {
+    this.spreadsheetId = spreadsheetId;
     this.name = name;
     this.headerRow = headerRow;
     this.sheetId = null;
@@ -54,9 +55,9 @@ class Sheet {
     this.colCount = 0;
     this.headers = [];
     this.headerToIdx = new Map();
-    this._validations = new Map();   // headerText (normalized) → { type, values, strict }
-    this._nextRowCache = null;        // 1-based; lazy
-    this._idempotencyMap = null;      // Map<key, row>; lazy
+    this._validations = new Map();
+    this._nextRowCache = null;
+    this._idempotencyMap = null;
   }
 
   /**
@@ -76,7 +77,7 @@ class Sheet {
         "data(startRow,startColumn,rowData(values(formattedValue,dataValidation)))" +
       ")";
 
-    const meta = await spreadsheetsGet({ ranges, includeGridData: true, fields });
+    const meta = await spreadsheetsGet(this.spreadsheetId, { ranges, includeGridData: true, fields });
 
     const sheetMeta = (meta.sheets || []).find(
       s => normHeader(s.properties?.title) === normHeader(this.name)
@@ -88,13 +89,11 @@ class Sheet {
     this.colCount = sheetMeta.properties.gridProperties?.columnCount ?? 0;
 
     const data = sheetMeta.data || [];
-    // data[0] = header row, data[1] = probe row (matches request order)
     const headerCells = data[0]?.rowData?.[0]?.values || [];
     const headerStartCol = data[0]?.startColumn ?? 0;
     const probeCells = data[1]?.rowData?.[0]?.values || [];
     const probeStartCol = data[1]?.startColumn ?? 0;
 
-    // Build headers array indexed by absolute column index
     const maxIdx = Math.max(
       headerStartCol + headerCells.length,
       probeStartCol + probeCells.length,
@@ -108,7 +107,6 @@ class Sheet {
       if (k) this.headerToIdx.set(k, idx);
     });
 
-    // Build validations indexed by header text
     for (let i = 0; i < probeCells.length; i++) {
       const colIdx = probeStartCol + i;
       const dv = probeCells[i]?.dataValidation;
@@ -146,10 +144,6 @@ class Sheet {
     return idx;
   }
 
-  /**
-   * Get the next available row number (1-based). Lazily initialized from
-   * a single valuesGet, then incremented locally on each successful write.
-   */
   async _getNextRow() {
     if (this._nextRowCache != null) return this._nextRowCache;
 
@@ -158,7 +152,7 @@ class Sheet {
     const minIdx = Math.min(...indices);
     const maxIdx = Math.max(...indices);
     const range = `${quoteSheetName(this.name)}!${colLetter(minIdx)}${this.headerRow + 1}:${colLetter(maxIdx)}`;
-    const rows = await valuesGet(range);
+    const rows = await valuesGet(this.spreadsheetId, range);
 
     let lastFilledOffset = 0;
     for (let i = rows.length - 1; i >= 0; i--) {
@@ -176,13 +170,9 @@ class Sheet {
     return this._nextRowCache;
   }
 
-  /**
-   * Lazy-load the full idempotency token map for this sheet. One round trip,
-   * results stay cached for the lifetime of this Sheet handle.
-   */
   async _loadIdempotency() {
     if (this._idempotencyMap) return this._idempotencyMap;
-    const matches = await developerMetadataSearch([
+    const matches = await developerMetadataSearch(this.spreadsheetId, [
       {
         developerMetadataLookup: {
           metadataKey: META_KEY_IDEMPOTENCY,
@@ -205,7 +195,7 @@ class Sheet {
 
   _validateRecord(record, errors) {
     for (const [header, value] of Object.entries(record)) {
-      this._col(header);  // throws on unknown header
+      this._col(header);
       if (typeof value === "string" && value.startsWith("=")) continue;
 
       const rule = this._validations.get(normHeader(header));
@@ -218,24 +208,12 @@ class Sheet {
     }
   }
 
-  /**
-   * Insert N records atomically. ONE batchUpdate covers all inserts and
-   * idempotency tokens. ~3 round trips total regardless of N (init done
-   * upstream; idempotency + nextRow + batchUpdate).
-   *
-   * records: Array<{ "Header": value | "=formula" }>
-   * opts:
-   *   idempotencyKey?: (record, index) => string   per-record key generator
-   *   format?: StyleObject                          applied to each new row
-   *   dryRun?: boolean
-   */
   async insertMany(records, opts = {}) {
     if (!Array.isArray(records)) throw new Error("insertMany expects an array");
     if (records.length === 0) {
       return { inserted: [], skipped: [], rows: [] };
     }
 
-    // 1. Validate every record locally
     const errors = [];
     for (let i = 0; i < records.length; i++) {
       const rec = records[i];
@@ -249,7 +227,6 @@ class Sheet {
       throw e;
     }
 
-    // 2. Bulk idempotency check
     const keyFn = opts.idempotencyKey;
     const keys = new Array(records.length).fill(null);
     let needIdemMap = false;
@@ -279,7 +256,6 @@ class Sheet {
       return { inserted: [], skipped, rows: [] };
     }
 
-    // 3. Compute target rows
     const startRow = await this._getNextRow();
     const rowFormat = opts.format;
 
@@ -295,9 +271,8 @@ class Sheet {
       };
     }
 
-    await batchUpdate(requests);
+    await batchUpdate(this.spreadsheetId, requests);
 
-    // 4. Update local caches
     this._nextRowCache = startRow + toInsert.length;
     if (idemMap) {
       for (let i = 0; i < toInsert.length; i++) {
@@ -312,9 +287,6 @@ class Sheet {
     };
   }
 
-  /**
-   * Single-record insert. Sugar over insertMany.
-   */
   async insert(record, opts = {}) {
     const manyOpts = {
       ...(opts.format && { format: opts.format }),
@@ -336,7 +308,6 @@ class Sheet {
     const N = toInsert.length;
     const requests = [];
 
-    // 1. Insert N empty rows starting at startIndex
     requests.push({
       insertDimension: {
         range: {
@@ -349,7 +320,6 @@ class Sheet {
       },
     });
 
-    // 2. Compute max column across all records
     let maxColIdx = 0;
     const perRecord = toInsert.map(({ record }) => {
       const cellsByIdx = new Map();
@@ -361,7 +331,6 @@ class Sheet {
       return cellsByIdx;
     });
 
-    // Build rows with cell values, encoding formulas with the actual target row
     const rows = perRecord.map((cellsByIdx, i) => {
       const targetRow = startRow + i;
       const values = new Array(maxColIdx + 1).fill(null).map((_, colIdx) =>
@@ -380,7 +349,6 @@ class Sheet {
       },
     });
 
-    // 3. Optional row format (applied across all new rows in one repeatCell)
     if (rowFormat) {
       const { cellFormat, fields } = compileStyle(rowFormat);
       requests.push({
@@ -398,7 +366,6 @@ class Sheet {
       });
     }
 
-    // 4. Idempotency tokens for non-duplicate records that have a key
     for (let i = 0; i < toInsert.length; i++) {
       const key = toInsert[i].key;
       if (!key) continue;
@@ -448,14 +415,9 @@ class Sheet {
     });
   }
 
-  /**
-   * Find rows matching a where-clause. Reads the data area once.
-   *
-   * where: { "Header": value, "Header2": value }
-   */
   async find(where = {}) {
     const range = `${quoteSheetName(this.name)}!A${this.headerRow + 1}:ZZ`;
-    const rows = await valuesGet(range);
+    const rows = await valuesGet(this.spreadsheetId, range);
     const filterEntries = Object.entries(where);
 
     const results = [];
@@ -483,10 +445,6 @@ class Sheet {
     return r;
   }
 
-  /**
-   * Resolve { rows?, where? } to an array of 1-based row numbers.
-   * `rows` short-circuits find() — useful when the agent already knows the row.
-   */
   async _resolveRows({ rows, where }) {
     if (rows != null) {
       const arr = Array.isArray(rows) ? rows : [rows];
@@ -499,11 +457,6 @@ class Sheet {
     throw new Error("Provide either `rows` or `where`");
   }
 
-  /**
-   * Update cells in selected rows.
-   *
-   * { where, set } | { rows, set }
-   */
   async update({ where, rows, set }) {
     const errors = [];
     this._validateRecord(set ?? {}, errors);
@@ -529,15 +482,10 @@ class Sheet {
     }
 
     if (requests.length === 0) return { updated: 0, rows: [] };
-    await batchUpdate(requests);
+    await batchUpdate(this.spreadsheetId, requests);
     return { updated: targetRows.length, rows: targetRows };
   }
 
-  /**
-   * Delete selected rows (deleteDimension).
-   *
-   * { where } | { rows }
-   */
   async delete({ where, rows }) {
     const targetRows = await this._resolveRows({ rows, where });
     if (targetRows.length === 0) return { deleted: 0, rows: [] };
@@ -548,18 +496,14 @@ class Sheet {
         range: { sheetId: this.sheetId, dimension: "ROWS", startIndex: r - 1, endIndex: r },
       },
     }));
-    await batchUpdate(requests);
+    await batchUpdate(this.spreadsheetId, requests);
 
-    // Invalidate row-position-dependent caches
     this._nextRowCache = null;
     if (this._idempotencyMap) this._idempotencyMap = null;
 
     return { deleted: targetRows.length, rows: targetRows };
   }
 
-  /**
-   * Format selected rows.
-   */
   async format({ where, rows, set }) {
     const targetRows = await this._resolveRows({ rows, where });
     if (targetRows.length === 0) return { formatted: 0, rows: [] };
@@ -579,14 +523,10 @@ class Sheet {
         fields,
       },
     }));
-    await batchUpdate(requests);
+    await batchUpdate(this.spreadsheetId, requests);
     return { formatted: targetRows.length, rows: targetRows };
   }
 
-  /**
-   * Set data validation on a column.
-   * spec: { type: "ONE_OF_LIST", values: string[], strict?: boolean }
-   */
   async setValidation(header, spec) {
     const idx = this._col(header);
     if (spec.type !== "ONE_OF_LIST") {
@@ -610,9 +550,8 @@ class Sheet {
         },
       },
     }];
-    await batchUpdate(requests);
+    await batchUpdate(this.spreadsheetId, requests);
 
-    // Update local cache
     this._validations.set(normHeader(header), {
       type: "ONE_OF_LIST",
       values: spec.values.map(v => String(v)),
@@ -621,26 +560,17 @@ class Sheet {
     return { ok: true };
   }
 
-  /**
-   * Read a raw A1 range. Returns 2D array of values (formatted), or [] if empty.
-   * `valueRender`: "FORMATTED_VALUE" | "UNFORMATTED_VALUE" | "FORMULA".
-   */
   async readRange(a1, { valueRender = "UNFORMATTED_VALUE" } = {}) {
     const range = `${quoteSheetName(this.name)}!${a1}`;
-    return valuesGet(range, { valueRenderOption: valueRender });
+    return valuesGet(this.spreadsheetId, range, { valueRenderOption: valueRender });
   }
 
-  /**
-   * Write a raw A1 range. `values` is a 2D array. By default values are parsed
-   * by Sheets (USER_ENTERED) so "=A1+B1" becomes a formula and "1.5" a number.
-   * Pass { raw: true } to write strings verbatim.
-   */
   async writeRange(a1, values, { raw = false } = {}) {
     if (!Array.isArray(values) || !Array.isArray(values[0])) {
       throw new Error("writeRange: values must be a 2D array");
     }
     const range = `${quoteSheetName(this.name)}!${a1}`;
-    const res = await valuesUpdate(range, values, { raw });
+    const res = await valuesUpdate(this.spreadsheetId, range, values, { raw });
     return {
       updatedRange: res.updatedRange,
       updatedRows: res.updatedRows ?? 0,

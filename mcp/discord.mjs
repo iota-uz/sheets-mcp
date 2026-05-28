@@ -1,28 +1,21 @@
 /**
- * Discord REST API client for reading messages from #finances channel.
+ * Discord REST API client for reading messages from a configured channel.
  *
  * Reads messages via the Discord REST API (no gateway/websocket needed),
  * downloads image attachments to a local folder, and returns structured
  * data that Claude can process.
  *
- * Config is read from environment variables:
- *   DISCORD_BOT_TOKEN, DISCORD_CHANNEL_ID
+ * Config read from environment:
+ *   DISCORD_BOT_TOKEN    Bot token
+ *   DISCORD_CHANNEL_ID   Channel to read from
+ *   DISCORD_IMAGES_DIR   (optional) Where to write attachments.
+ *                        Default: <cwd>/reports/discord
  */
 
 import fs from "fs";
 import path from "path";
-import { fileURLToPath } from "url";
-import { loadEnv } from "./env.mjs";
-
-const __dirname = path.dirname(fileURLToPath(import.meta.url));
-const PROJECT_ROOT = path.resolve(__dirname, "..");
-const IMAGES_DIR = path.join(PROJECT_ROOT, "reports", "discord");
 
 const DISCORD_API = "https://discord.com/api/v10";
-
-// ───────────────────────────────────────────────────────────────────────────
-// Discord REST API
-// ───────────────────────────────────────────────────────────────────────────
 
 async function discordFetch(endpoint, token) {
   const res = await fetch(`${DISCORD_API}${endpoint}`, {
@@ -47,29 +40,23 @@ async function downloadFile(url, destPath) {
   return destPath;
 }
 
-// ───────────────────────────────────────────────────────────────────────────
-// Public API
-// ───────────────────────────────────────────────────────────────────────────
-
-/**
- * Read the last N messages from the #finances Discord channel.
- * Downloads image attachments to `Reports/discord/`.
- */
 export async function readFinancesChannel(options = {}) {
-  const env = loadEnv();
-  const token = env.DISCORD_BOT_TOKEN;
-  const channelId = env.DISCORD_CHANNEL_ID;
+  const token = process.env.DISCORD_BOT_TOKEN;
+  const channelId = process.env.DISCORD_CHANNEL_ID;
 
   if (!token || !channelId) {
-    throw new Error("DISCORD_BOT_TOKEN and DISCORD_CHANNEL_ID must be set in .env");
+    throw new Error("DISCORD_BOT_TOKEN and DISCORD_CHANNEL_ID must be set in the MCP env.");
   }
+
+  const imagesDir = process.env.DISCORD_IMAGES_DIR
+    || path.join(process.cwd(), "reports", "discord");
 
   const limit = Math.min(options.limit || 10, 100);
   let endpoint = `/channels/${channelId}/messages?limit=${limit}`;
   if (options.after) endpoint += `&after=${options.after}`;
 
   const messages = await discordFetch(endpoint, token);
-  messages.reverse(); // chronological order
+  messages.reverse();
 
   const result = [];
 
@@ -79,7 +66,7 @@ export async function readFinancesChannel(options = {}) {
       if (att.content_type && att.content_type.startsWith("image/")) {
         const ext = path.extname(att.filename) || ".png";
         const localName = `${msg.id}_${att.id}${ext}`;
-        const destPath = path.join(IMAGES_DIR, localName);
+        const destPath = path.join(imagesDir, localName);
 
         try {
           await downloadFile(att.url, destPath);
