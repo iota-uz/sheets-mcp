@@ -18,7 +18,7 @@
   "license": "Apache-2.0",
   "repository": {
     "type": "git",
-    "url": "git+https://github.com/iota-uz/IOTA-Finance.git"
+    "url": "git+https://github.com/iota-uz/sheets-mcp.git"
   },
   "publishConfig": {
     "access": "public"
