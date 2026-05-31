@@ -7,7 +7,6 @@ on:
 
 permissions:
   contents: read
-  id-token: write
 
 jobs:
   publish:
@@ -20,14 +19,13 @@ jobs:
           node-version: '20'
           registry-url: 'https://registry.npmjs.org'
 
-      # Trusted Publishing (OIDC) needs npm >= 11.5.1; node 20 ships older.
-      - run: npm install -g npm@latest
-
       - run: npm ci
 
       # Prerelease versions (e.g. 0.1.0-rc.1) can't go to the `latest` dist-tag,
       # so route them to `rc`; stable versions publish to `latest`.
       - name: Publish to npm
+        env:
+          NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
         run: |
           VERSION=$(node -p "require('./package.json').version")
           if [[ "$VERSION" == *-* ]]; then
