@@ -45,16 +45,22 @@ export async function exec(spreadsheetId, code, { dryRun = false, timeoutMs = 30
 
   let result;
   let error = null;
+  let timeoutTimer = null;
   try {
     const wrapped = `(async () => {\n${code}\n})()`;
     const promise = vm.runInContext(wrapped, ctx, { timeout: timeoutMs, displayErrors: true });
     result = await Promise.race([
       promise,
-      new Promise((_, rej) => setTimeout(() => rej(new Error(`Script timeout after ${timeoutMs}ms`)), timeoutMs)),
+      new Promise((_, rej) => {
+        timeoutTimer = setTimeout(() => rej(new Error(`Script timeout after ${timeoutMs}ms`)), timeoutMs);
+      }),
     ]);
   } catch (e) {
     error = { message: e.message, stack: e.stack, name: e.name ?? "Error" };
   } finally {
+    // Clear the timeout timer so a fast script doesn't leave it dangling and
+    // hold the event loop open for the full timeoutMs.
+    if (timeoutTimer) clearTimeout(timeoutTimer);
     if (dryRun) setDryRunMode(null);
     clearCache();
   }

@@ -85,7 +85,15 @@ test("a1ToGridRange — malformed throws", () => {
   assert.throws(() => a1ToGridRange(0, ""));
   assert.throws(() => a1ToGridRange(0, "   "));
   assert.throws(() => a1ToGridRange(0, "!!"));
-  assert.throws(() => a1ToGridRange(0, "A0")); // row must be ≥ 1
+  assert.throws(() => a1ToGridRange(0, "A0"));       // row must be ≥ 1
+  assert.throws(() => a1ToGridRange(0, "A1:B2:C3"));  // more than one ":"
+});
+
+test("a1ToGridRange — normalizes reversed bounded ranges", () => {
+  assert.deepEqual(a1ToGridRange(0, "D10:B2"), a1ToGridRange(0, "B2:D10"));
+  assert.deepEqual(a1ToGridRange(0, "D2:B5"), {
+    sheetId: 0, startColumnIndex: 1, endColumnIndex: 4, startRowIndex: 1, endRowIndex: 5,
+  });
 });
 
 test("gridRangeToA1 — round-trips common shapes", () => {

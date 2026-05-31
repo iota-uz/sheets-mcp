@@ -139,6 +139,19 @@ test("conditionFromSpec — argument sourcing per type", () => {
   assert.deepEqual(conditionFromSpec({ type: "BOOLEAN" }), { type: "BOOLEAN" }); // no values
 });
 
+test("conditionFromSpec — rejects missing operands", () => {
+  assert.throws(() => conditionFromSpec({ type: "ONE_OF_LIST", values: [] }), /non-empty/);
+  assert.throws(() => conditionFromSpec({ type: "ONE_OF_RANGE" }), /requires \{ range \}/);
+  assert.throws(() => conditionFromSpec({ type: "CUSTOM_FORMULA" }), /requires \{ formula \}/);
+  assert.throws(() => conditionFromSpec({ type: "NUMBER_BETWEEN", min: 1 }), /requires \{ min, max \}/);
+  assert.throws(() => conditionFromSpec({ type: "NUMBER_GREATER" }), /requires \{ value \}/);
+  assert.throws(() => conditionFromSpec({}), /spec.type is required/);
+});
+
+test("buildFindReplace — rejects an unscoped request", () => {
+  assert.throws(() => buildFindReplace({ find: "a", replacement: "b" }), /scope required/);
+});
+
 test("buildSetValidation — rule shape, defaults, clear", () => {
   assert.deepEqual(buildSetValidation(RANGE, { type: "ONE_OF_LIST", values: ["x"] }),
     [{ setDataValidation: { range: RANGE, rule: {

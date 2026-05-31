@@ -237,7 +237,14 @@ The A1↔GridRange math (`mcp/a1.mjs`) and the Sheets v4 request builders (`mcp/
 npm test   # node --test — unit tests for the A1 grammar + request builders
 ```
 
-No network or credentials needed; the tests cover the pure layers (`a1.mjs`, `requests.mjs`).
+No network or credentials needed; the tests cover the pure layers (`a1.mjs`, `requests.mjs`) plus the dry-run wiring (`integration.test.mjs`).
+
+## Known limitations
+
+- **Dry-run capture is process-global.** Concurrent `sheets_exec` calls in the same server process share one capture buffer; treat exec as single-flight (a future change can scope it per-call via `AsyncLocalStorage`).
+- **Stale handles after structural tab changes.** A `Sheet` obtained before `sheets.renameSheet`/`deleteSheet` keeps its old name and will build A1 ranges against it. Re-fetch with `sheets.sheet(name)` after renaming/deleting a tab. (`insertColumns`/`deleteColumns` self-refresh the handle they're called on.)
+- **Idempotency tokens are keyed by sheet title.** Renaming a tab orphans its existing `idempotencyKey` tokens, so a re-insert after a rename can duplicate. Keep idempotency keys stable and avoid renaming tabs that rely on them.
+- **Duplicate header texts are ambiguous.** Headers that collide after normalization (case-insensitive, `ё`→`е`) resolve to the last matching column. Give columns distinct header text.
 
 ## Release (maintainers)
 

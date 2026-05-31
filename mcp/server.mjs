@@ -145,7 +145,7 @@ const tools = [
       properties: {
         spreadsheetId: { type: "string", description: "Target Google Sheets spreadsheet ID. Bound to the `sheets` global for this call." },
         code: { type: "string", description: "JS code to execute. Has access to `sheets`, `console`." },
-        dryRun: { type: "boolean", description: "If true, batchUpdate calls are recorded, not sent." },
+        dryRun: { type: "boolean", description: "If true, every mutating call (batchUpdate + value writes) is recorded into planned/plannedOps, not sent." },
         timeoutMs: { type: "number", description: "Execution timeout in milliseconds (default 30000)." },
       },
       required: ["spreadsheetId", "code"],

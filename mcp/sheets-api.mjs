@@ -18,6 +18,7 @@ import {
   batchUpdate,
   valuesBatchGet,
   getSpreadsheet,
+  spreadsheetsGet,
   developerMetadataSearch,
 } from "./sheets-client.mjs";
 import {
@@ -57,7 +58,12 @@ export function makeSheetsApi(spreadsheetId) {
     // ── raw escape hatch ──
     batchUpdate: (requests, opts) => batchUpdate(spreadsheetId, requests, opts),
     valuesBatchGet: (ranges, opts) => valuesBatchGet(spreadsheetId, ranges, opts),
-    getSpreadsheet: (opts) => getSpreadsheet(spreadsheetId, opts),
+    // Default fetch returns sheet/dev-metadata; pass { fields } / { ranges } for
+    // full control (e.g. named ranges, grid data) via the lower-level get.
+    getSpreadsheet: (opts = {}) =>
+      (opts.fields || opts.ranges)
+        ? spreadsheetsGet(spreadsheetId, opts)
+        : getSpreadsheet(spreadsheetId, opts),
     developerMetadataSearch: (filters) => developerMetadataSearch(spreadsheetId, filters),
 
     // ── structural ops ──

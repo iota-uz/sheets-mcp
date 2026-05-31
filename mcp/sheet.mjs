@@ -115,6 +115,11 @@ class Sheet {
       headerStartCol + headerCells.length,
       probeStartCol + probeCells.length,
     );
+    // Reset derived maps so _init() is safe to call again (e.g. after a column
+    // insert/delete that shifts every header position).
+    this.headerToIdx = new Map();
+    this._validations = new Map();
+
     this.headers = new Array(maxIdx).fill("");
     for (let i = 0; i < headerCells.length; i++) {
       this.headers[headerStartCol + i] = headerCells[i]?.formattedValue ?? "";
@@ -553,7 +558,7 @@ class Sheet {
     const { cellFormat, fields } = compileStyle(style);
     const grid = a1ToGridRange(this.sheetId, a1);
     await batchUpdate(this.spreadsheetId, buildRepeatCellFormat(grid, cellFormat, fields));
-    return { formatted: "range", range: a1 };
+    return { ok: true, range: a1 };
   }
 
   // ── Presentation / structure sugar (all compile to batchUpdate ⇒ dry-run aware) ──
@@ -595,14 +600,14 @@ class Sheet {
   async insertColumns(at, count = 1) {
     const idx = this._colPos(at);
     await batchUpdate(this.spreadsheetId, buildInsertColumns(this.sheetId, idx, count));
-    this._invalidateStructure();
+    await this._invalidateStructure();
     return { ok: true, at: idx, count };
   }
 
   async deleteColumns(at, count = 1) {
     const idx = this._colPos(at);
     await batchUpdate(this.spreadsheetId, buildDeleteColumns(this.sheetId, idx, count));
-    this._invalidateStructure();
+    await this._invalidateStructure();
     return { ok: true, at: idx, count };
   }
 
@@ -653,11 +658,16 @@ class Sheet {
     return colToIdx(String(at));
   }
 
-  /** After a column insert/delete the cached headers/width are stale — drop caches. */
-  _invalidateStructure() {
+  /**
+   * After a column insert/delete the cached header positions/width are stale.
+   * Drop the derived caches, evict shared handles, and re-read this handle's
+   * metadata so subsequent calls on it resolve the new column positions.
+   */
+  async _invalidateStructure() {
     this._nextRowCache = null;
     this._idempotencyMap = null;
     clearCache();
+    await this._init();
   }
 
   /**

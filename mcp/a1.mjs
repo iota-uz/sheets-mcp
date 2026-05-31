@@ -102,13 +102,31 @@ export function a1ToGridRange(sheetId, a1) {
   const range = { sheetId };
 
   if (body.includes(":")) {
-    const [l, r] = body.split(":");
-    const left = parseRef(l);
-    const right = parseRef(r);
+    const parts = body.split(":");
+    if (parts.length !== 2) {
+      throw new Error(`a1ToGridRange: malformed range "${a1}" — expected a single ":"`);
+    }
+    const left = parseRef(parts[0]);
+    const right = parseRef(parts[1]);
     if (left.col != null) range.startColumnIndex = left.col;
     if (left.row != null) range.startRowIndex = left.row;
     if (right.col != null) range.endColumnIndex = right.col + 1;
     if (right.row != null) range.endRowIndex = right.row + 1;
+    // Normalize reversed but fully-bounded ranges ("D10:B2" → "B2:D10"); a
+    // start>end GridRange is rejected by the API. Open-ended ranges (one side
+    // missing a bound) are left untouched.
+    if (range.startColumnIndex != null && range.endColumnIndex != null) {
+      const a = range.startColumnIndex;
+      const b = range.endColumnIndex - 1;
+      range.startColumnIndex = Math.min(a, b);
+      range.endColumnIndex = Math.max(a, b) + 1;
+    }
+    if (range.startRowIndex != null && range.endRowIndex != null) {
+      const a = range.startRowIndex;
+      const b = range.endRowIndex - 1;
+      range.startRowIndex = Math.min(a, b);
+      range.endRowIndex = Math.max(a, b) + 1;
+    }
   } else {
     const ref = parseRef(body);
     if (ref.col != null) {

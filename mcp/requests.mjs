@@ -193,6 +193,9 @@ export function buildSetFilter(range) {
 
 /** Exactly one of { sheetId, range, allSheets } must be set (caller defaults sheetId). */
 export function buildFindReplace(opts) {
+  if (!opts.allSheets && !opts.range && opts.sheetId == null) {
+    throw new Error("findReplace: scope required — pass sheetId, range, or allSheets");
+  }
   const fr = { find: opts.find, replacement: opts.replacement ?? "" };
   if (opts.allSheets) fr.allSheets = true;
   else if (opts.range) fr.range = opts.range;
@@ -215,6 +218,11 @@ function toRangeFormula(range) {
   return r.startsWith("=") ? r : `=${r}`;
 }
 
+// Condition types that take no operand (so a missing value isn't an error).
+const NO_ARG_CONDITIONS = new Set([
+  "BOOLEAN", "BLANK", "NOT_BLANK", "TEXT_IS_EMAIL", "TEXT_IS_URL", "DATE_IS_VALID",
+]);
+
 /**
  * Map a friendly validation spec to a Sheets BooleanCondition.
  * spec.type is a Sheets ConditionType (e.g. "NUMBER_BETWEEN", "DATE_AFTER",
@@ -230,17 +238,28 @@ export function conditionFromSpec(spec) {
 
   let values;
   if (type === "ONE_OF_LIST") {
-    values = (spec.values || []).map(v => ({ userEnteredValue: String(v) }));
+    if (!Array.isArray(spec.values) || spec.values.length === 0) {
+      throw new Error("validation ONE_OF_LIST: requires a non-empty { values }");
+    }
+    values = spec.values.map(v => ({ userEnteredValue: String(v) }));
   } else if (type === "ONE_OF_RANGE") {
+    if (!spec.range) throw new Error("validation ONE_OF_RANGE: requires { range }");
     values = [{ userEnteredValue: toRangeFormula(spec.range) }];
   } else if (type === "CUSTOM_FORMULA") {
-    values = [{ userEnteredValue: spec.formula ?? spec.value }];
+    const formula = spec.formula ?? spec.value;
+    if (formula == null) throw new Error("validation CUSTOM_FORMULA: requires { formula }");
+    values = [{ userEnteredValue: String(formula) }];
   } else if (/_BETWEEN$/.test(type)) {
+    if (spec.min == null || spec.max == null) {
+      throw new Error(`validation ${type}: requires { min, max }`);
+    }
     values = [spec.min, spec.max].map(v => ({ userEnteredValue: String(v) }));
   } else if (spec.value !== undefined) {
     values = [{ userEnteredValue: String(spec.value) }];
   } else if (Array.isArray(spec.values)) {
     values = spec.values.map(v => ({ userEnteredValue: String(v) }));
+  } else if (!NO_ARG_CONDITIONS.has(type)) {
+    throw new Error(`validation ${type}: requires { value }`);
   }
 
   const condition = { type };
