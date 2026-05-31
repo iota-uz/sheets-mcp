@@ -1,9 +1,8 @@
 /**
- * Generic helpers for the Sheet API: style normalizer, color parser,
- * column-letter math.
+ * Generic helpers for the Sheet API: style normalizer, color parser.
  *
  * Kept separate from sheet.mjs so the helpers are stateless and reusable.
- * No sheet-specific knowledge here.
+ * No sheet-specific knowledge here. (Column-letter math lives in a1.mjs.)
  */
 
 const NAMED_COLORS = {
@@ -90,12 +89,4 @@ export function compileStyle(style) {
   }
 
   return { cellFormat: { userEnteredFormat: fmt }, fields: fields.join(",") };
-}
-
-/**
- * 0-based column index → A1 letter (A, B, ..., Z, AA, AB, ...).
- */
-export function colLetter(i) {
-  if (i < 26) return String.fromCharCode(65 + i);
-  return String.fromCharCode(65 + Math.floor(i / 26) - 1) + String.fromCharCode(65 + (i % 26));
 }

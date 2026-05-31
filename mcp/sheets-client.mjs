@@ -1,5 +1,6 @@
 /**
- * Low-level Google Sheets client. Internal use only — Table API wraps this.
+ * Low-level Google Sheets calls. `makeClient` is the only export — it bundles
+ * these into a per-exec, dry-run-aware client that the Sheet API consumes.
  *
  * Auth-scoped (one Google client per process); every call takes a
  * spreadsheetId so one server can serve many spreadsheets.
@@ -20,7 +21,7 @@ function getSheets() {
 /**
  * Get full spreadsheet metadata: sheet IDs, properties, dev metadata.
  */
-export async function getSpreadsheet(spreadsheetId, { includeGridData = false } = {}) {
+async function getSpreadsheet(spreadsheetId, { includeGridData = false } = {}) {
   const sheets = getSheets();
   const res = await sheets.spreadsheets.get({
     spreadsheetId,
@@ -34,7 +35,7 @@ export async function getSpreadsheet(spreadsheetId, { includeGridData = false } 
  * Lower-level spreadsheets.get with full control over ranges + fields.
  * Used by Sheet._init to fetch sheet metadata + header/probe rows in one call.
  */
-export async function spreadsheetsGet(spreadsheetId, { ranges, includeGridData = false, fields } = {}) {
+async function spreadsheetsGet(spreadsheetId, { ranges, includeGridData = false, fields } = {}) {
   const sheets = getSheets();
   const params = { spreadsheetId };
   if (ranges) params.ranges = ranges;
@@ -44,28 +45,17 @@ export async function spreadsheetsGet(spreadsheetId, { ranges, includeGridData =
   return res.data;
 }
 
-// Dry-run capture: when set, batchUpdate records the request body and returns a
-// synthetic response instead of calling the API. Toggled by the runner.
-let dryRunCapture = null;
-
-export function setDryRunMode(capture) {
-  dryRunCapture = capture; // null to disable; an array to capture into
-}
-
 /**
  * Send one or more batchUpdate requests atomically.
  * Requests array follows Google Sheets API v4 Request schema.
+ *
+ * Pure API call. Dry-run capture is handled one layer up by makeClient, so this
+ * is never reached when previewing.
  */
-export async function batchUpdate(spreadsheetId, requests, { responseIncludeGridData = false } = {}) {
+async function batchUpdate(spreadsheetId, requests, { responseIncludeGridData = false } = {}) {
   if (!Array.isArray(requests) || requests.length === 0) {
     throw new Error("batchUpdate requires a non-empty requests array");
   }
-
-  if (dryRunCapture) {
-    dryRunCapture.push({ spreadsheetId, requests });
-    return { spreadsheetId, replies: requests.map(() => ({})) };
-  }
-
   const sheets = getSheets();
   const res = await sheets.spreadsheets.batchUpdate({
     spreadsheetId,
@@ -81,7 +71,7 @@ export async function batchUpdate(spreadsheetId, requests, { responseIncludeGrid
  * Read values for a range. Returns the raw values array (or empty array).
  * `valueRenderOption`: "FORMATTED_VALUE" (default), "UNFORMATTED_VALUE", "FORMULA".
  */
-export async function valuesGet(spreadsheetId, range, { valueRenderOption = "UNFORMATTED_VALUE" } = {}) {
+async function valuesGet(spreadsheetId, range, { valueRenderOption = "UNFORMATTED_VALUE" } = {}) {
   const sheets = getSheets();
   const res = await sheets.spreadsheets.values.get({
     spreadsheetId,
@@ -94,7 +84,7 @@ export async function valuesGet(spreadsheetId, range, { valueRenderOption = "UNF
 /**
  * Read multiple ranges in one round trip.
  */
-export async function valuesBatchGet(spreadsheetId, ranges, { valueRenderOption = "UNFORMATTED_VALUE" } = {}) {
+async function valuesBatchGet(spreadsheetId, ranges, { valueRenderOption = "UNFORMATTED_VALUE" } = {}) {
   const sheets = getSheets();
   const res = await sheets.spreadsheets.values.batchGet({
     spreadsheetId,
@@ -108,7 +98,7 @@ export async function valuesBatchGet(spreadsheetId, ranges, { valueRenderOption 
  * Search DeveloperMetadata by data filters.
  * `filters` is an array of { developerMetadataLookup: {...} } objects.
  */
-export async function developerMetadataSearch(spreadsheetId, filters) {
+async function developerMetadataSearch(spreadsheetId, filters) {
   const sheets = getSheets();
   const res = await sheets.spreadsheets.developerMetadata.search({
     spreadsheetId,
@@ -119,9 +109,9 @@ export async function developerMetadataSearch(spreadsheetId, filters) {
 
 /**
  * Update a single value range. Used for ad-hoc cell writes that don't need
- * the full atomicity of batchUpdate.
+ * the full atomicity of batchUpdate. Pure API call (dry-run handled by makeClient).
  */
-export async function valuesUpdate(spreadsheetId, range, values, { raw = false } = {}) {
+async function valuesUpdate(spreadsheetId, range, values, { raw = false } = {}) {
   const sheets = getSheets();
   const res = await sheets.spreadsheets.values.update({
     spreadsheetId,
@@ -130,4 +120,50 @@ export async function valuesUpdate(spreadsheetId, range, values, { raw = false }
     requestBody: { values },
   });
   return res.data;
+}
+
+/**
+ * Per-exec client: bundles every Google call, scoped to one dry-run `capture`.
+ *
+ * Mutations (batchUpdate, valuesUpdate) consult `capture`: when set, the
+ * intended op is recorded as a tagged entry and a synthetic reply is returned
+ * WITHOUT touching the API. Reads always pass through. Because the capture is
+ * closed over per call to makeClient(), concurrent sheets_exec runs never see
+ * each other's writes (issue #7 limitation #1).
+ *
+ * Tagged capture entries:
+ *   { kind: "batchUpdate", spreadsheetId, requests }
+ *   { kind: "valuesUpdate", spreadsheetId, range, values, valueInputOption }
+ */
+export function makeClient({ capture = null } = {}) {
+  return {
+    async batchUpdate(spreadsheetId, requests, opts = {}) {
+      if (!Array.isArray(requests) || requests.length === 0) {
+        throw new Error("batchUpdate requires a non-empty requests array");
+      }
+      if (capture) {
+        capture.push({ kind: "batchUpdate", spreadsheetId, requests });
+        return { spreadsheetId, replies: requests.map(() => ({})) };
+      }
+      return batchUpdate(spreadsheetId, requests, opts);
+    },
+
+    async valuesUpdate(spreadsheetId, range, values, opts = {}) {
+      const valueInputOption = opts.raw ? "RAW" : "USER_ENTERED";
+      if (capture) {
+        capture.push({ kind: "valuesUpdate", spreadsheetId, range, values, valueInputOption });
+        const updatedColumns = values.reduce((m, r) => Math.max(m, Array.isArray(r) ? r.length : 0), 0);
+        const updatedCells = values.reduce((s, r) => s + (Array.isArray(r) ? r.length : 0), 0);
+        return { updatedRange: range, updatedRows: values.length, updatedColumns, updatedCells };
+      }
+      return valuesUpdate(spreadsheetId, range, values, opts);
+    },
+
+    // Reads — always pass through (dry-run previews writes, not reads).
+    getSpreadsheet,
+    spreadsheetsGet,
+    valuesGet,
+    valuesBatchGet,
+    developerMetadataSearch,
+  };
 }

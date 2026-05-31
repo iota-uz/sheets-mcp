@@ -32,7 +32,8 @@
     "anthropic"
   ],
   "scripts": {
-    "start": "node mcp/server.mjs"
+    "start": "node mcp/server.mjs",
+    "test": "node --test"
   },
   "dependencies": {
     "@modelcontextprotocol/sdk": "^1.0.4",

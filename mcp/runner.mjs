@@ -1,29 +1,30 @@
 /**
  * Script runner — executes agent-supplied JS against the generic Sheet API.
  *
- * Each call is bound to a specific spreadsheetId. The sandbox exposes
- * `sheets.sheet(name, opts?)` and `sheets.spreadsheetId()` already bound,
- * so agent scripts don't repeat the ID per call.
+ * Each call is bound to a specific spreadsheetId and gets its own client +
+ * session, so concurrent execs are fully isolated. The sandbox exposes the
+ * `sheets` global (sheet/spreadsheetId + structural ops + raw hatch) already
+ * bound, so agent scripts don't repeat the ID per call.
  *
- * dryRun: when true, batchUpdate calls go into a captured array instead of
- * being sent. The runner returns the captured request bodies.
+ * dryRun: when true, the client captures every intended mutation instead of
+ * sending it; the runner returns that ordered log as `plannedOps`.
  */
 
 import vm from "vm";
-import { sheet as makeSheet, clearCache } from "./sheet.mjs";
-import { setDryRunMode } from "./sheets-client.mjs";
+import { makeClient } from "./sheets-client.mjs";
+import { makeSheetsApi } from "./sheets-api.mjs";
 
 export async function exec(spreadsheetId, code, { dryRun = false, timeoutMs = 30000 } = {}) {
   if (!spreadsheetId) throw new Error("exec requires a spreadsheetId");
 
   const stdout = [];
   const stderr = [];
-  const captured = { batchUpdates: [] };
-
-  const sheets = {
-    sheet: (name, opts) => makeSheet(spreadsheetId, name, opts),
-    spreadsheetId: () => spreadsheetId,
-  };
+  // Per-exec dry-run capture: an ordered log of tagged planned ops
+  // ({ kind: "batchUpdate" | "valuesUpdate", ... }), or null when committing.
+  // Held by this exec's client only, so concurrent execs never interfere.
+  const capture = dryRun ? [] : null;
+  const client = makeClient({ capture });
+  const sheets = makeSheetsApi(spreadsheetId, client);
 
   const sandboxConsole = {
     log:   (...a) => stdout.push(a.map(stringify).join(" ")),
@@ -31,11 +32,6 @@ export async function exec(spreadsheetId, code, { dryRun = false, timeoutMs = 30
     warn:  (...a) => stderr.push(a.map(stringify).join(" ")),
     error: (...a) => stderr.push(a.map(stringify).join(" ")),
   };
-
-  if (dryRun) {
-    setDryRunMode(captured.batchUpdates);
-    clearCache();
-  }
 
   const ctx = vm.createContext({
     sheets,
@@ -46,18 +42,22 @@ export async function exec(spreadsheetId, code, { dryRun = false, timeoutMs = 30
 
   let result;
   let error = null;
+  let timeoutTimer = null;
   try {
     const wrapped = `(async () => {\n${code}\n})()`;
     const promise = vm.runInContext(wrapped, ctx, { timeout: timeoutMs, displayErrors: true });
     result = await Promise.race([
       promise,
-      new Promise((_, rej) => setTimeout(() => rej(new Error(`Script timeout after ${timeoutMs}ms`)), timeoutMs)),
+      new Promise((_, rej) => {
+        timeoutTimer = setTimeout(() => rej(new Error(`Script timeout after ${timeoutMs}ms`)), timeoutMs);
+      }),
     ]);
   } catch (e) {
     error = { message: e.message, stack: e.stack, name: e.name ?? "Error" };
   } finally {
-    if (dryRun) setDryRunMode(null);
-    clearCache();
+    // Clear the timeout timer so a fast script doesn't leave it dangling and
+    // hold the event loop open for the full timeoutMs.
+    if (timeoutTimer) clearTimeout(timeoutTimer);
   }
 
   return {
@@ -66,7 +66,12 @@ export async function exec(spreadsheetId, code, { dryRun = false, timeoutMs = 30
     stdout: stdout.join("\n"),
     stderr: stderr.join("\n"),
     ...(error && { error }),
-    ...(dryRun && { dryRun: true, planned: captured.batchUpdates }),
+    ...(dryRun && {
+      dryRun: true,
+      // Ordered log of every intended mutation, each tagged with its `kind`
+      // ("batchUpdate" → { requests } | "valuesUpdate" → { range, values }).
+      plannedOps: capture,
+    }),
   };
 }
 

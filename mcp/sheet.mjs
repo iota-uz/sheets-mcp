@@ -16,48 +16,78 @@
  *   - update/delete/format accept an explicit `rows: [...]` to skip find().
  */
 
-import { compileStyle, colLetter } from "./schema.mjs";
+import { compileStyle } from "./schema.mjs";
+import { colLetter, colToIdx, a1ToGridRange } from "./a1.mjs";
 import {
-  batchUpdate,
-  spreadsheetsGet,
-  developerMetadataSearch,
-  valuesGet,
-  valuesUpdate,
-} from "./sheets-client.mjs";
-
-const META_KEY_IDEMPOTENCY = "sheets-mcp:idempotency";
-
-const sheetCache = new Map();
+  META_KEY_IDEMPOTENCY,
+  buildDeveloperMetadata,
+  buildRepeatCellFormat,
+  buildMerge,
+  buildUnmerge,
+  buildSetBorders,
+  buildAddConditionalFormat,
+  buildFreeze,
+  buildResizeColumns,
+  buildInsertColumns,
+  buildDeleteColumns,
+  buildSort,
+  buildSetFilter,
+  buildFindReplace,
+  buildSetNote,
+  buildSetValidation,
+} from "./requests.mjs";
 
 /**
- * Get a Sheet handle. Cached per (spreadsheetId, name, headerRow).
+ * Construct + initialize a Sheet handle bound to an injected `client` (which
+ * carries the dry-run capture). No process-global cache — the session
+ * (makeSheetsApi) owns per-exec handle caching. Returns a Proxy that throws on
+ * any public method call once the tab has been deleted (issue #7 limitation #2).
  */
-export async function sheet(spreadsheetId, name, opts = {}) {
-  const cacheKey = `${spreadsheetId}|${name}|${opts.headerRow ?? 1}`;
-  if (sheetCache.has(cacheKey)) return sheetCache.get(cacheKey);
-  const s = new Sheet(spreadsheetId, name, opts);
+export async function createSheet(spreadsheetId, name, opts, client) {
+  const s = new Sheet(spreadsheetId, name, opts, client);
   await s._init();
-  sheetCache.set(cacheKey, s);
-  return s;
+  return guardDeleted(s);
 }
 
-export function clearCache() {
-  sheetCache.clear();
+/** Wrap a Sheet so public method calls throw after the tab is deleted. */
+function guardDeleted(sheet) {
+  return new Proxy(sheet, {
+    get(target, prop, receiver) {
+      const value = Reflect.get(target, prop, receiver);
+      if (
+        target._deleted &&
+        typeof value === "function" &&
+        typeof prop === "string" &&
+        !prop.startsWith("_")
+      ) {
+        return () => { throw new Error(`Sheet "${target.name}" was deleted`); };
+      }
+      return value;
+    },
+  });
 }
 
 class Sheet {
-  constructor(spreadsheetId, name, { headerRow = 1 } = {}) {
+  constructor(spreadsheetId, name, { headerRow = 1 } = {}, client) {
     this.spreadsheetId = spreadsheetId;
     this.name = name;
     this.headerRow = headerRow;
+    this.client = client;
     this.sheetId = null;
     this.rowCount = 0;
     this.colCount = 0;
     this.headers = [];
     this.headerToIdx = new Map();
+    this._ambiguous = new Map();
     this._validations = new Map();
     this._nextRowCache = null;
     this._idempotencyMap = null;
+    this._deleted = false;
+    this._onStructureChange = null; // set by the session; (handle) => Promise
+  }
+
+  _markDeleted() {
+    this._deleted = true;
   }
 
   /**
@@ -77,7 +107,7 @@ class Sheet {
         "data(startRow,startColumn,rowData(values(formattedValue,dataValidation)))" +
       ")";
 
-    const meta = await spreadsheetsGet(this.spreadsheetId, { ranges, includeGridData: true, fields });
+    const meta = await this.client.spreadsheetsGet(this.spreadsheetId, { ranges, includeGridData: true, fields });
 
     const sheetMeta = (meta.sheets || []).find(
       s => normHeader(s.properties?.title) === normHeader(this.name)
@@ -102,10 +132,13 @@ class Sheet {
     for (let i = 0; i < headerCells.length; i++) {
       this.headers[headerStartCol + i] = headerCells[i]?.formattedValue ?? "";
     }
-    this.headers.forEach((h, idx) => {
-      const k = normHeader(h);
-      if (k) this.headerToIdx.set(k, idx);
-    });
+    // indexHeaders is the single source of truth for header→column mapping and
+    // collision detection; recomputed each _init() so a re-init (after a column
+    // op) reflects the shifted positions.
+    const { headerToIdx, ambiguous } = indexHeaders(this.headers);
+    this.headerToIdx = headerToIdx;
+    this._ambiguous = ambiguous;
+    this._validations = new Map();
 
     for (let i = 0; i < probeCells.length; i++) {
       const colIdx = probeStartCol + i;
@@ -136,7 +169,12 @@ class Sheet {
   }
 
   _col(header) {
-    const idx = this.headerToIdx.get(normHeader(header));
+    const k = normHeader(header);
+    if (this._ambiguous.has(k)) {
+      const cols = this._ambiguous.get(k).map(colLetter).join(", ");
+      throw new Error(`Ambiguous header "${header}" — appears in columns ${cols}. Make headers unique.`);
+    }
+    const idx = this.headerToIdx.get(k);
     if (idx == null) {
       const known = this.headers.filter(Boolean).join(", ");
       throw new Error(`Unknown header "${header}". Known: ${known}`);
@@ -152,7 +190,7 @@ class Sheet {
     const minIdx = Math.min(...indices);
     const maxIdx = Math.max(...indices);
     const range = `${quoteSheetName(this.name)}!${colLetter(minIdx)}${this.headerRow + 1}:${colLetter(maxIdx)}`;
-    const rows = await valuesGet(this.spreadsheetId, range);
+    const rows = await this.client.valuesGet(this.spreadsheetId, range);
 
     let lastFilledOffset = 0;
     for (let i = rows.length - 1; i >= 0; i--) {
@@ -172,22 +210,23 @@ class Sheet {
 
   async _loadIdempotency() {
     if (this._idempotencyMap) return this._idempotencyMap;
-    const matches = await developerMetadataSearch(this.spreadsheetId, [
+    const matches = await this.client.developerMetadataSearch(this.spreadsheetId, [
       {
         developerMetadataLookup: {
           metadataKey: META_KEY_IDEMPOTENCY,
         },
       },
     ]);
+    // Tokens are scoped to this sheet by location.sheetId — NOT by a title prefix
+    // — so they survive a tab rename (issue #7 limitation #3). The whole value is
+    // the key.
     const map = new Map();
-    const prefix = `${this.name}:`;
     for (const m of matches) {
       const md = m.developerMetadata;
-      if (!md?.metadataValue?.startsWith(prefix)) continue;
+      if (md?.metadataValue == null) continue;
       const loc = md.location?.dimensionRange;
       if (loc?.sheetId !== this.sheetId) continue;
-      const key = md.metadataValue.slice(prefix.length);
-      map.set(key, loc.startIndex + 1);
+      map.set(md.metadataValue, loc.startIndex + 1);
     }
     this._idempotencyMap = map;
     return map;
@@ -261,17 +300,10 @@ class Sheet {
 
     const requests = this._buildBatchInsertRequests({ startRow, toInsert, rowFormat });
 
-    if (opts.dryRun) {
-      return {
-        inserted: toInsert.map((t, i) => ({ index: t.index, row: startRow + i, key: t.key })),
-        skipped,
-        rows: toInsert.map((_, i) => startRow + i),
-        dryRun: true,
-        requests,
-      };
-    }
-
-    await batchUpdate(this.spreadsheetId, requests);
+    // Routes through the client: under dry-run the requests are captured and a
+    // synthetic reply returned, so the bookkeeping below runs either way and two
+    // inserts in one dry-run script plan distinct rows.
+    await this.client.batchUpdate(this.spreadsheetId, requests);
 
     this._nextRowCache = startRow + toInsert.length;
     if (idemMap) {
@@ -290,7 +322,6 @@ class Sheet {
   async insert(record, opts = {}) {
     const manyOpts = {
       ...(opts.format && { format: opts.format }),
-      ...(opts.dryRun && { dryRun: opts.dryRun }),
     };
     if (opts.idempotencyKey != null) {
       manyOpts.idempotencyKey = () => String(opts.idempotencyKey);
@@ -299,7 +330,7 @@ class Sheet {
     if (result.skipped.length > 0) {
       return { row: result.skipped[0].existingRow, idempotencyHit: result.skipped[0].existingRow, inserted: false };
     }
-    return { row: result.inserted[0].row, idempotencyHit: null, inserted: true, ...(opts.dryRun && { dryRun: true, requests: result.requests }) };
+    return { row: result.inserted[0].row, idempotencyHit: null, inserted: true };
   }
 
   _buildBatchInsertRequests({ startRow, toInsert, rowFormat }) {
@@ -369,23 +400,7 @@ class Sheet {
     for (let i = 0; i < toInsert.length; i++) {
       const key = toInsert[i].key;
       if (!key) continue;
-      requests.push({
-        createDeveloperMetadata: {
-          developerMetadata: {
-            metadataKey: META_KEY_IDEMPOTENCY,
-            metadataValue: `${this.name}:${key}`,
-            location: {
-              dimensionRange: {
-                sheetId,
-                dimension: "ROWS",
-                startIndex: startIndex + i,
-                endIndex: startIndex + i + 1,
-              },
-            },
-            visibility: "PROJECT",
-          },
-        },
-      });
+      requests.push(buildDeveloperMetadata(sheetId, key, startIndex + i));
     }
 
     return requests;
@@ -417,7 +432,7 @@ class Sheet {
 
   async find(where = {}) {
     const range = `${quoteSheetName(this.name)}!A${this.headerRow + 1}:ZZ`;
-    const rows = await valuesGet(this.spreadsheetId, range);
+    const rows = await this.client.valuesGet(this.spreadsheetId, range);
     const filterEntries = Object.entries(where);
 
     const results = [];
@@ -482,7 +497,7 @@ class Sheet {
     }
 
     if (requests.length === 0) return { updated: 0, rows: [] };
-    await batchUpdate(this.spreadsheetId, requests);
+    await this.client.batchUpdate(this.spreadsheetId, requests);
     return { updated: targetRows.length, rows: targetRows };
   }
 
@@ -496,7 +511,7 @@ class Sheet {
         range: { sheetId: this.sheetId, dimension: "ROWS", startIndex: r - 1, endIndex: r },
       },
     }));
-    await batchUpdate(this.spreadsheetId, requests);
+    await this.client.batchUpdate(this.spreadsheetId, requests);
 
     this._nextRowCache = null;
     if (this._idempotencyMap) this._idempotencyMap = null;
@@ -504,7 +519,11 @@ class Sheet {
     return { deleted: targetRows.length, rows: targetRows };
   }
 
-  async format({ where, rows, set }) {
+  async format({ where, rows, range, set }) {
+    // Arbitrary range / single column / off-header cells: format exactly that range.
+    if (range != null) return this.formatRange(range, set);
+
+    // Whole-row path (backward compatible): style every column of the target rows.
     const targetRows = await this._resolveRows({ rows, where });
     if (targetRows.length === 0) return { formatted: 0, rows: [] };
 
@@ -523,46 +542,189 @@ class Sheet {
         fields,
       },
     }));
-    await batchUpdate(this.spreadsheetId, requests);
+    await this.client.batchUpdate(this.spreadsheetId, requests);
     return { formatted: targetRows.length, rows: targetRows };
   }
 
+  /** Format an arbitrary A1 range ("B2:D10", "C:C", "A1") — not limited to whole rows. */
+  async formatRange(a1, style) {
+    const { cellFormat, fields } = compileStyle(style);
+    const grid = a1ToGridRange(this.sheetId, a1);
+    await this.client.batchUpdate(this.spreadsheetId, buildRepeatCellFormat(grid, cellFormat, fields));
+    return { ok: true, range: a1 };
+  }
+
+  // ── Presentation / structure sugar (all compile to batchUpdate ⇒ dry-run aware) ──
+
+  async merge(range, type = "MERGE_ALL") {
+    await this.client.batchUpdate(this.spreadsheetId, buildMerge(a1ToGridRange(this.sheetId, range), type));
+    return { ok: true, range, mergeType: type };
+  }
+
+  async unmerge(range) {
+    await this.client.batchUpdate(this.spreadsheetId, buildUnmerge(a1ToGridRange(this.sheetId, range)));
+    return { ok: true, range };
+  }
+
+  async setBorders(range, spec = "all") {
+    await this.client.batchUpdate(this.spreadsheetId, buildSetBorders(a1ToGridRange(this.sheetId, range), spec));
+    return { ok: true, range };
+  }
+
+  async addConditionalFormat(range, rule) {
+    await this.client.batchUpdate(this.spreadsheetId, buildAddConditionalFormat(a1ToGridRange(this.sheetId, range), rule));
+    return { ok: true, range };
+  }
+
+  async freeze({ rows, cols } = {}) {
+    await this.client.batchUpdate(this.spreadsheetId, buildFreeze(this.sheetId, { rows, cols }));
+    return { ok: true, rows, cols };
+  }
+
+  /** range: a column range ("B:D" / "C:C"). opts: { width } | { auto: true }. */
+  async resizeColumns(range, opts = {}) {
+    const grid = a1ToGridRange(this.sheetId, range);
+    if (grid.startColumnIndex == null) throw new Error(`resizeColumns: "${range}" must specify columns`);
+    const endCol = grid.endColumnIndex ?? grid.startColumnIndex + 1;
+    await this.client.batchUpdate(this.spreadsheetId, buildResizeColumns(this.sheetId, grid.startColumnIndex, endCol, opts));
+    return { ok: true, range };
+  }
+
+  async insertColumns(at, count = 1) {
+    const idx = this._colPos(at);
+    await this.client.batchUpdate(this.spreadsheetId, buildInsertColumns(this.sheetId, idx, count));
+    await this._invalidateStructure();
+    return { ok: true, at: idx, count };
+  }
+
+  async deleteColumns(at, count = 1) {
+    const idx = this._colPos(at);
+    await this.client.batchUpdate(this.spreadsheetId, buildDeleteColumns(this.sheetId, idx, count));
+    await this._invalidateStructure();
+    return { ok: true, at: idx, count };
+  }
+
+  /** specs: [{ column: header|letter|index, order?: "ASC"|"DESC" }]. */
+  async sort(range, specs) {
+    const grid = a1ToGridRange(this.sheetId, range);
+    const norm = (specs || []).map(s => ({
+      dimensionIndex: s.dimensionIndex != null ? s.dimensionIndex : this._colPos(s.column),
+      order: s.order,
+    }));
+    await this.client.batchUpdate(this.spreadsheetId, buildSort(grid, norm));
+    return { ok: true, range };
+  }
+
+  async setFilter(range) {
+    await this.client.batchUpdate(this.spreadsheetId, buildSetFilter(a1ToGridRange(this.sheetId, range)));
+    return { ok: true, range };
+  }
+
+  /** Scoped to THIS sheet by default. opts: { range?, allSheets?, matchCase?, matchEntireCell?, searchByRegex?, includeFormulas? }. */
+  async findReplace(find, replacement, opts = {}) {
+    const frOpts = {
+      find,
+      replacement,
+      matchCase: opts.matchCase,
+      matchEntireCell: opts.matchEntireCell,
+      searchByRegex: opts.searchByRegex,
+      includeFormulas: opts.includeFormulas,
+    };
+    if (opts.allSheets) frOpts.allSheets = true;
+    else if (opts.range) frOpts.range = a1ToGridRange(this.sheetId, opts.range);
+    else frOpts.sheetId = this.sheetId;
+
+    const res = await this.client.batchUpdate(this.spreadsheetId, buildFindReplace(frOpts));
+    return res?.replies?.[0]?.findReplace ?? { ok: true };
+  }
+
+  async setNote(cell, text) {
+    await this.client.batchUpdate(this.spreadsheetId, buildSetNote(a1ToGridRange(this.sheetId, cell), text));
+    return { ok: true, cell };
+  }
+
+  /** Column position from a header name, a column letter, or a 0-based index. */
+  _colPos(at) {
+    if (typeof at === "number") return at;
+    const k = normHeader(at);
+    if (this._ambiguous.has(k)) {
+      const cols = this._ambiguous.get(k).map(colLetter).join(", ");
+      throw new Error(`Ambiguous header "${at}" — appears in columns ${cols}. Make headers unique.`);
+    }
+    if (this.headerToIdx.has(k)) return this.headerToIdx.get(k);
+    return colToIdx(String(at));
+  }
+
+  /**
+   * After a column insert/delete the cached header positions/width are stale.
+   * Re-read this handle's metadata, then ask the session to refresh any other
+   * cached handles pointing at the same tab (different headerRow) so they don't
+   * keep stale column positions.
+   */
+  async _invalidateStructure() {
+    this._nextRowCache = null;
+    this._idempotencyMap = null;
+    await this._init();
+    await this._onStructureChange?.(this);
+  }
+
+  /**
+   * Set or clear a column's data validation. Applies to the whole column below
+   * the header row. spec.type is a Sheets ConditionType:
+   *   ONE_OF_LIST { values, strict?, showCustomUi? }      (dropdown)
+   *   ONE_OF_RANGE { range, strict? }                     (dropdown from a range)
+   *   NUMBER_BETWEEN/NOT_BETWEEN { min, max }
+   *   NUMBER_GREATER/LESS/EQ/… { value }
+   *   DATE_BETWEEN { min, max } | DATE_AFTER/BEFORE/… { value } | DATE_IS_VALID {}
+   *   TEXT_CONTAINS/STARTS_WITH/EQ/… { value } | TEXT_IS_EMAIL/URL {}
+   *   BOOLEAN {}                                          (checkbox)
+   *   CUSTOM_FORMULA { formula }
+   *   "clear" | { clear: true }                           (remove validation)
+   */
   async setValidation(header, spec) {
     const idx = this._col(header);
-    if (spec.type !== "ONE_OF_LIST") {
-      throw new Error(`setValidation: unsupported type "${spec.type}" — only ONE_OF_LIST for now`);
-    }
-    const requests = [{
-      setDataValidation: {
-        range: {
-          sheetId: this.sheetId,
-          startRowIndex: this.headerRow,
-          startColumnIndex: idx,
-          endColumnIndex: idx + 1,
-        },
-        rule: {
-          condition: {
-            type: "ONE_OF_LIST",
-            values: spec.values.map(v => ({ userEnteredValue: String(v) })),
-          },
-          showCustomUi: true,
-          strict: spec.strict ?? false,
-        },
-      },
-    }];
-    await batchUpdate(this.spreadsheetId, requests);
+    const range = {
+      sheetId: this.sheetId,
+      startRowIndex: this.headerRow,
+      startColumnIndex: idx,
+      endColumnIndex: idx + 1,
+    };
+    await this.client.batchUpdate(this.spreadsheetId, buildSetValidation(range, spec));
 
-    this._validations.set(normHeader(header), {
-      type: "ONE_OF_LIST",
-      values: spec.values.map(v => String(v)),
-      strict: spec.strict ?? false,
-    });
+    // Keep the in-memory validation cache (consulted by insert/update) in sync.
+    // Only ONE_OF_LIST is enforced locally; other types and clears just evict.
+    const k = normHeader(header);
+    if (spec?.type === "clear" || spec?.clear === true) {
+      this._validations.delete(k);
+    } else if (spec.type === "ONE_OF_LIST") {
+      this._validations.set(k, {
+        type: "ONE_OF_LIST",
+        values: spec.values.map(v => String(v)),
+        strict: spec.strict ?? false,
+      });
+    } else {
+      this._validations.delete(k);
+    }
     return { ok: true };
+  }
+
+  /**
+   * Richer read: pull formatting, notes, merges, validation and hyperlinks for
+   * an arbitrary A1 range. Returns { data, merges } from the Sheets grid data.
+   */
+  async readFormatting(a1, { fields } = {}) {
+    const range = `${quoteSheetName(this.name)}!${a1}`;
+    const mask = fields ||
+      "sheets(merges,data(startRow,startColumn,rowData(values(" +
+      "formattedValue,userEnteredValue,effectiveFormat,note,dataValidation,hyperlink))))";
+    const meta = await this.client.spreadsheetsGet(this.spreadsheetId, { ranges: [range], includeGridData: true, fields: mask });
+    const sheet = (meta.sheets || [])[0] || {};
+    return { data: sheet.data || [], merges: sheet.merges || [] };
   }
 
   async readRange(a1, { valueRender = "UNFORMATTED_VALUE" } = {}) {
     const range = `${quoteSheetName(this.name)}!${a1}`;
-    return valuesGet(this.spreadsheetId, range, { valueRenderOption: valueRender });
+    return this.client.valuesGet(this.spreadsheetId, range, { valueRenderOption: valueRender });
   }
 
   async writeRange(a1, values, { raw = false } = {}) {
@@ -570,7 +732,7 @@ class Sheet {
       throw new Error("writeRange: values must be a 2D array");
     }
     const range = `${quoteSheetName(this.name)}!${a1}`;
-    const res = await valuesUpdate(this.spreadsheetId, range, values, { raw });
+    const res = await this.client.valuesUpdate(this.spreadsheetId, range, values, { raw });
     return {
       updatedRange: res.updatedRange,
       updatedRows: res.updatedRows ?? 0,
@@ -580,8 +742,32 @@ class Sheet {
   }
 }
 
-function normHeader(s) {
+export function normHeader(s) {
   return String(s ?? "").trim().toLowerCase().replace(/ё/g, "е");
+}
+
+/**
+ * Index a header row by normalized text. Headers that collide after
+ * normalization (case-insensitive, ё→е) are NOT placed in headerToIdx — they go
+ * to `ambiguous` (normKey → all colliding 0-based column indices) so a write
+ * keyed by an ambiguous header fails loudly instead of hitting the wrong column
+ * (issue #7 limitation #4). Empty/whitespace headers are ignored.
+ */
+export function indexHeaders(headers) {
+  const seen = new Map(); // normKey → [idx, ...]
+  headers.forEach((h, idx) => {
+    const k = normHeader(h);
+    if (!k) return;
+    if (seen.has(k)) seen.get(k).push(idx);
+    else seen.set(k, [idx]);
+  });
+  const headerToIdx = new Map();
+  const ambiguous = new Map();
+  for (const [k, idxs] of seen) {
+    if (idxs.length > 1) ambiguous.set(k, idxs);
+    else headerToIdx.set(k, idxs[0]);
+  }
+  return { headerToIdx, ambiguous };
 }
 
 function quoteSheetName(name) {
