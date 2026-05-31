@@ -1,12 +1,13 @@
 /**
  * Script runner — executes agent-supplied JS against the generic Sheet API.
  *
- * Each call is bound to a specific spreadsheetId. The sandbox exposes
- * `sheets.sheet(name, opts?)` and `sheets.spreadsheetId()` already bound,
- * so agent scripts don't repeat the ID per call.
+ * Each call is bound to a specific spreadsheetId and gets its own client +
+ * session, so concurrent execs are fully isolated. The sandbox exposes the
+ * `sheets` global (sheet/spreadsheetId + structural ops + raw hatch) already
+ * bound, so agent scripts don't repeat the ID per call.
  *
- * dryRun: when true, batchUpdate calls go into a captured array instead of
- * being sent. The runner returns the captured request bodies.
+ * dryRun: when true, the client captures every intended mutation instead of
+ * sending it; the runner returns that ordered log as `plannedOps`.
  */
 
 import vm from "vm";
@@ -67,11 +68,8 @@ export async function exec(spreadsheetId, code, { dryRun = false, timeoutMs = 30
     ...(error && { error }),
     ...(dryRun && {
       dryRun: true,
-      // `planned` = the batchUpdate request bodies; `plannedOps` = the full
-      // ordered log of every intended mutation (incl. writeRange value writes).
-      planned: capture
-        .filter(e => e.kind === "batchUpdate")
-        .map(({ spreadsheetId: id, requests }) => ({ spreadsheetId: id, requests })),
+      // Ordered log of every intended mutation, each tagged with its `kind`
+      // ("batchUpdate" → { requests } | "valuesUpdate" → { range, values }).
       plannedOps: capture,
     }),
   };

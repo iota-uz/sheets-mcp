@@ -18,11 +18,11 @@ test("runner dry-run — addSheet is captured, not committed, returns a placehol
   assert.equal(out.ok, true);
   assert.deepEqual(out.result, { sheetId: null, title: "обязательства", dryRun: true });
 
-  assert.equal(out.planned.length, 1);
-  const req = out.planned[0].requests[0];
+  assert.equal(out.plannedOps.length, 1);
+  assert.equal(out.plannedOps[0].kind, "batchUpdate");
+  const req = out.plannedOps[0].requests[0];
   assert.equal(req.addSheet.properties.title, "обязательства");
   assert.equal(req.addSheet.properties.gridProperties.frozenRowCount, 1);
-  assert.deepEqual(out.plannedOps.map(e => e.kind), ["batchUpdate"]);
 });
 
 test("runner dry-run — raw escape hatch batchUpdate is captured, not committed", async () => {

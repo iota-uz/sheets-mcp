@@ -140,17 +140,3 @@ export function a1ToGridRange(sheetId, a1) {
   }
   return range;
 }
-
-/**
- * GridRange → compact A1 string (no sheet prefix). For diagnostics/tests.
- */
-export function gridRangeToA1(range) {
-  const { startRowIndex, endRowIndex, startColumnIndex, endColumnIndex } = range;
-  const start =
-    (startColumnIndex != null ? colLetter(startColumnIndex) : "") +
-    (startRowIndex != null ? String(startRowIndex + 1) : "");
-  const end =
-    (endColumnIndex != null ? colLetter(endColumnIndex - 1) : "") +
-    (endRowIndex != null ? String(endRowIndex) : "");
-  return end && end !== start ? `${start}:${end}` : start;
-}

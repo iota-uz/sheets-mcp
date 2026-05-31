@@ -2,14 +2,8 @@
  * Generic helpers for the Sheet API: style normalizer, color parser.
  *
  * Kept separate from sheet.mjs so the helpers are stateless and reusable.
- * No sheet-specific knowledge here.
- *
- * Column-letter math lives in a1.mjs (the single source of truth); colLetter
- * is re-exported here so existing `import { colLetter } from "./schema.mjs"`
- * call sites keep working.
+ * No sheet-specific knowledge here. (Column-letter math lives in a1.mjs.)
  */
-
-export { colLetter } from "./a1.mjs";
 
 const NAMED_COLORS = {
   white: "#ffffff", black: "#000000", red: "#ff0000",

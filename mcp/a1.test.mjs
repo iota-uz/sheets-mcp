@@ -1,6 +1,6 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
-import { colLetter, colToIdx, a1ToGridRange, gridRangeToA1 } from "./a1.mjs";
+import { colLetter, colToIdx, a1ToGridRange } from "./a1.mjs";
 
 test("colLetter — boundaries", () => {
   assert.equal(colLetter(0), "A");
@@ -96,7 +96,3 @@ test("a1ToGridRange — normalizes reversed bounded ranges", () => {
   });
 });
 
-test("gridRangeToA1 — round-trips common shapes", () => {
-  assert.equal(gridRangeToA1(a1ToGridRange(0, "B2:D10")), "B2:D10");
-  assert.equal(gridRangeToA1(a1ToGridRange(0, "A1")), "A1");
-});

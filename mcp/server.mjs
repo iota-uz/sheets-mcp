@@ -22,7 +22,7 @@ import {
 
 import { exec } from "./runner.mjs";
 import { createSheet } from "./sheet.mjs";
-import { getSpreadsheet, makeClient } from "./sheets-client.mjs";
+import { makeClient } from "./sheets-client.mjs";
 import { readChannelMessages } from "./discord.mjs";
 
 const SHEETS_LIB_DOC = `
@@ -135,8 +135,8 @@ const tools = [
     description:
       "Run JavaScript against the typed Sheet API.\n\n" + SHEETS_LIB_DOC + "\n\n" +
       "Set dryRun: true to capture every intended mutation without committing — returned as " +
-      "`planned` (batchUpdate request bodies, back-compat) and `plannedOps` (the full ordered " +
-      "log, including writeRange value writes). " +
+      "`plannedOps`, an ordered log of every intended mutation (batchUpdate request bodies and " +
+      "writeRange value writes), each tagged with its `kind`. " +
       "The script is wrapped in `async () => { <your code> }` and awaited; whatever you `return` " +
       "comes back as `result`. Console.log/info/warn/error are captured.",
     inputSchema: {
@@ -144,7 +144,7 @@ const tools = [
       properties: {
         spreadsheetId: { type: "string", description: "Target Google Sheets spreadsheet ID. Bound to the `sheets` global for this call." },
         code: { type: "string", description: "JS code to execute. Has access to `sheets`, `console`." },
-        dryRun: { type: "boolean", description: "If true, every mutating call (batchUpdate + value writes) is recorded into planned/plannedOps, not sent." },
+        dryRun: { type: "boolean", description: "If true, every mutating call (batchUpdate + value writes) is recorded into plannedOps, not sent." },
         timeoutMs: { type: "number", description: "Execution timeout in milliseconds (default 30000)." },
       },
       required: ["spreadsheetId", "code"],
@@ -169,14 +169,15 @@ const tools = [
 const handlers = {
   sheets_describe: async (a) => {
     if (!a?.spreadsheetId) throw new Error("`spreadsheetId` is required");
+    const client = makeClient();
     if (!a?.sheet) {
-      const meta = await getSpreadsheet(a.spreadsheetId);
+      const meta = await client.getSpreadsheet(a.spreadsheetId);
       return {
         spreadsheetId: meta.spreadsheetId,
         sheets: meta.sheets.map(s => ({ title: s.properties.title, sheetId: s.properties.sheetId })),
       };
     }
-    const s = await createSheet(a.spreadsheetId, a.sheet, { headerRow: a.headerRow }, makeClient());
+    const s = await createSheet(a.spreadsheetId, a.sheet, { headerRow: a.headerRow }, client);
     return s.describe();
   },
 

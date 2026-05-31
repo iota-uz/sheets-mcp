@@ -71,7 +71,7 @@ Execute JavaScript against the typed Sheet API in a sandboxed `vm` context. The 
 |-----------------|-----------|---------|--------------------------------------------------------|
 | `spreadsheetId` | `string`  | —       | **Required.** Bound to the `sheets` global for this call. |
 | `code`          | `string`  | —       | **Required.** JS to execute. Has access to `sheets`, `console`, JS builtins. |
-| `dryRun`        | `boolean` | `false` | If true, every mutation is recorded — not sent. Returned as `planned[]` (batchUpdate bodies) and `plannedOps[]` (full ordered log, incl. `writeRange` value writes). |
+| `dryRun`        | `boolean` | `false` | If true, every mutation is recorded — not sent — into `plannedOps[]`, an ordered log of each intended op (batchUpdate bodies + `writeRange` value writes), tagged with its `kind`. |
 | `timeoutMs`     | `number`  | `30000` | Execution timeout in milliseconds.                     |
 
 The `sheets` global (bound to the call's `spreadsheetId`):
@@ -213,7 +213,7 @@ await s.freeze({ rows: 1 });
 
 **Dry-run preview:**
 
-Pass `dryRun: true` to `sheets_exec` to capture every intended mutation without committing. The response carries `planned[]` (the `batchUpdate` request bodies — same shape as before) and `plannedOps[]` (the full ordered log, including `writeRange` value writes).
+Pass `dryRun: true` to `sheets_exec` to capture every intended mutation without committing. The response carries `plannedOps[]` — an ordered log of every intended op, each tagged with its `kind` (`"batchUpdate"` with `requests`, or `"valuesUpdate"` with `range`/`values`).
 
 ## Architecture
 

@@ -1,5 +1,6 @@
 /**
- * Low-level Google Sheets client. Internal use only — Table API wraps this.
+ * Low-level Google Sheets calls. `makeClient` is the only export — it bundles
+ * these into a per-exec, dry-run-aware client that the Sheet API consumes.
  *
  * Auth-scoped (one Google client per process); every call takes a
  * spreadsheetId so one server can serve many spreadsheets.
@@ -20,7 +21,7 @@ function getSheets() {
 /**
  * Get full spreadsheet metadata: sheet IDs, properties, dev metadata.
  */
-export async function getSpreadsheet(spreadsheetId, { includeGridData = false } = {}) {
+async function getSpreadsheet(spreadsheetId, { includeGridData = false } = {}) {
   const sheets = getSheets();
   const res = await sheets.spreadsheets.get({
     spreadsheetId,
@@ -34,7 +35,7 @@ export async function getSpreadsheet(spreadsheetId, { includeGridData = false } 
  * Lower-level spreadsheets.get with full control over ranges + fields.
  * Used by Sheet._init to fetch sheet metadata + header/probe rows in one call.
  */
-export async function spreadsheetsGet(spreadsheetId, { ranges, includeGridData = false, fields } = {}) {
+async function spreadsheetsGet(spreadsheetId, { ranges, includeGridData = false, fields } = {}) {
   const sheets = getSheets();
   const params = { spreadsheetId };
   if (ranges) params.ranges = ranges;
@@ -51,7 +52,7 @@ export async function spreadsheetsGet(spreadsheetId, { ranges, includeGridData =
  * Pure API call. Dry-run capture is handled one layer up by makeClient, so this
  * is never reached when previewing.
  */
-export async function batchUpdate(spreadsheetId, requests, { responseIncludeGridData = false } = {}) {
+async function batchUpdate(spreadsheetId, requests, { responseIncludeGridData = false } = {}) {
   if (!Array.isArray(requests) || requests.length === 0) {
     throw new Error("batchUpdate requires a non-empty requests array");
   }
@@ -70,7 +71,7 @@ export async function batchUpdate(spreadsheetId, requests, { responseIncludeGrid
  * Read values for a range. Returns the raw values array (or empty array).
  * `valueRenderOption`: "FORMATTED_VALUE" (default), "UNFORMATTED_VALUE", "FORMULA".
  */
-export async function valuesGet(spreadsheetId, range, { valueRenderOption = "UNFORMATTED_VALUE" } = {}) {
+async function valuesGet(spreadsheetId, range, { valueRenderOption = "UNFORMATTED_VALUE" } = {}) {
   const sheets = getSheets();
   const res = await sheets.spreadsheets.values.get({
     spreadsheetId,
@@ -83,7 +84,7 @@ export async function valuesGet(spreadsheetId, range, { valueRenderOption = "UNF
 /**
  * Read multiple ranges in one round trip.
  */
-export async function valuesBatchGet(spreadsheetId, ranges, { valueRenderOption = "UNFORMATTED_VALUE" } = {}) {
+async function valuesBatchGet(spreadsheetId, ranges, { valueRenderOption = "UNFORMATTED_VALUE" } = {}) {
   const sheets = getSheets();
   const res = await sheets.spreadsheets.values.batchGet({
     spreadsheetId,
@@ -97,7 +98,7 @@ export async function valuesBatchGet(spreadsheetId, ranges, { valueRenderOption 
  * Search DeveloperMetadata by data filters.
  * `filters` is an array of { developerMetadataLookup: {...} } objects.
  */
-export async function developerMetadataSearch(spreadsheetId, filters) {
+async function developerMetadataSearch(spreadsheetId, filters) {
   const sheets = getSheets();
   const res = await sheets.spreadsheets.developerMetadata.search({
     spreadsheetId,
@@ -110,7 +111,7 @@ export async function developerMetadataSearch(spreadsheetId, filters) {
  * Update a single value range. Used for ad-hoc cell writes that don't need
  * the full atomicity of batchUpdate. Pure API call (dry-run handled by makeClient).
  */
-export async function valuesUpdate(spreadsheetId, range, values, { raw = false } = {}) {
+async function valuesUpdate(spreadsheetId, range, values, { raw = false } = {}) {
   const sheets = getSheets();
   const res = await sheets.spreadsheets.values.update({
     spreadsheetId,
