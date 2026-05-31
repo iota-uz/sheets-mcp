@@ -10,7 +10,8 @@
  */
 
 import vm from "vm";
-import { sheet as makeSheet, clearCache } from "./sheet.mjs";
+import { clearCache } from "./sheet.mjs";
+import { makeSheetsApi } from "./sheets-api.mjs";
 import { setDryRunMode } from "./sheets-client.mjs";
 
 export async function exec(spreadsheetId, code, { dryRun = false, timeoutMs = 30000 } = {}) {
@@ -18,12 +19,10 @@ export async function exec(spreadsheetId, code, { dryRun = false, timeoutMs = 30
 
   const stdout = [];
   const stderr = [];
-  const captured = { batchUpdates: [] };
+  // One ordered log of tagged planned ops ({ kind: "batchUpdate" | "valuesUpdate", ... }).
+  const captured = [];
 
-  const sheets = {
-    sheet: (name, opts) => makeSheet(spreadsheetId, name, opts),
-    spreadsheetId: () => spreadsheetId,
-  };
+  const sheets = makeSheetsApi(spreadsheetId);
 
   const sandboxConsole = {
     log:   (...a) => stdout.push(a.map(stringify).join(" ")),
@@ -33,7 +32,7 @@ export async function exec(spreadsheetId, code, { dryRun = false, timeoutMs = 30
   };
 
   if (dryRun) {
-    setDryRunMode(captured.batchUpdates);
+    setDryRunMode(captured);
     clearCache();
   }
 
@@ -66,7 +65,15 @@ export async function exec(spreadsheetId, code, { dryRun = false, timeoutMs = 30
     stdout: stdout.join("\n"),
     stderr: stderr.join("\n"),
     ...(error && { error }),
-    ...(dryRun && { dryRun: true, planned: captured.batchUpdates }),
+    ...(dryRun && {
+      dryRun: true,
+      // Back-compat: `planned` stays the batchUpdate request bodies, same shape as before.
+      planned: captured
+        .filter(e => e.kind === "batchUpdate")
+        .map(({ spreadsheetId: id, requests }) => ({ spreadsheetId: id, requests })),
+      // Full, honest log of every intended mutation in order (incl. writeRange value writes).
+      plannedOps: captured,
+    }),
   };
 }
 

@@ -31,6 +31,19 @@ The \`sheets\` global is bound to the spreadsheetId you passed in:
   sheets.sheet(name, { headerRow?: 1 })   → Promise<Sheet>
   sheets.spreadsheetId()                  → string
 
+  Structural ops (create/manage tabs):
+  sheets.addSheet(title, opts?)           → { sheetId, title }
+        opts: { rows?, cols?, index?, tabColor?, frozenRows?, frozenCols? }
+  sheets.deleteSheet(nameOrId)            → { ok }
+  sheets.renameSheet(nameOrId, newTitle) → { ok }
+  sheets.duplicateSheet(nameOrId, newTitle?) → { sheetId }
+
+  Raw escape hatch (full Sheets v4 power — compile your own requests):
+  sheets.batchUpdate(requests)           → runs any Sheets v4 Request[] (dry-run aware)
+  sheets.valuesBatchGet(ranges, opts?)   → multi-range read in one round trip
+  sheets.getSpreadsheet(opts?)           → spreadsheet metadata (all sheets, named ranges, …)
+  sheets.developerMetadataSearch(filters)→ dev-metadata lookup
+
 Sheet API:
   sheet.describe()                            → { sheet, sheetId, headerRow, rowCount, headers: [{index, letter, text}] }
 
@@ -54,16 +67,37 @@ Sheet API:
   sheet.update({ where?, rows?, set })        → Promise<{ updated, rows }>
         Pass \`rows: [123, 456]\` to skip find() when you already know the rows.
   sheet.delete({ where?, rows? })             → Promise<{ deleted, rows }>
-  sheet.format({ where?, rows?, set })        → Promise<{ formatted, rows }>
+  sheet.format({ where?, rows?, range?, set })→ Promise<{ formatted, rows }>
+        where/rows style whole rows; pass \`range\` (A1) to style an arbitrary range.
+  sheet.formatRange(a1, style)                → style any range/column ("B2:D10", "C:C").
 
-  sheet.setValidation(header, spec)           → set ONE_OF_LIST validation on a column
-        spec: { type: "ONE_OF_LIST", values: string[], strict?: boolean }
+  Presentation & analysis sugar (each → one atomic batchUpdate, dry-run aware):
+  sheet.merge(range, type?)  sheet.unmerge(range)        type: MERGE_ALL|MERGE_COLUMNS|MERGE_ROWS
+  sheet.setBorders(range, spec)              spec: "all" | "outer" | "DASHED" | { top?, bottom?, …, style?, color? }
+  sheet.addConditionalFormat(range, rule)    rule: { condition, format } | { gradient: { min, mid?, max } }
+  sheet.freeze({ rows?, cols? })
+  sheet.resizeColumns(range, { width } | { auto: true })   range: "B:D"
+  sheet.insertColumns(at, count?)  sheet.deleteColumns(at, count?)   at: header | letter | index
+  sheet.sort(range, [{ column, order?: "ASC"|"DESC" }])
+  sheet.setFilter(range)
+  sheet.findReplace(find, replace, opts?)    opts: { range?, allSheets?, matchCase?, searchByRegex?, … } (this sheet by default)
+  sheet.setNote(cell, text)
+
+  sheet.setValidation(header, spec)           → set/clear a column's data validation
+        spec.type ∈ ONE_OF_LIST { values } | ONE_OF_RANGE { range } | BOOLEAN {} |
+        NUMBER_BETWEEN { min, max } | NUMBER_GREATER/LESS/EQ { value } |
+        DATE_BETWEEN { min, max } | DATE_AFTER/BEFORE { value } |
+        TEXT_CONTAINS/EQ { value } | CUSTOM_FORMULA { formula } | "clear"
+        (+ optional strict?, showCustomUi?)
 
   sheet.readRange(a1, opts?)                  → Promise<any[][]>
         Raw A1 read (e.g. "A2:B90"). opts.valueRender:
         "UNFORMATTED_VALUE" (default) | "FORMATTED_VALUE" | "FORMULA".
+  sheet.readFormatting(a1, opts?)             → Promise<{ data, merges }>
+        Read formatting, notes, merges, validation & hyperlinks for a range.
   sheet.writeRange(a1, values, opts?)         → Promise<{ updatedRange, updatedCells, ... }>
         Raw A1 write of a 2D array. opts.raw=true to skip USER_ENTERED parsing.
+        (Honors dryRun — captured, not committed.)
 
 StyleObject keys:
   backgroundColor: "#hex" | "red" | {red,green,blue}
@@ -101,7 +135,9 @@ const tools = [
     name: "sheets_exec",
     description:
       "Run JavaScript against the typed Sheet API.\n\n" + SHEETS_LIB_DOC + "\n\n" +
-      "Set dryRun: true to capture the planned batchUpdate request bodies without committing. " +
+      "Set dryRun: true to capture every intended mutation without committing — returned as " +
+      "`planned` (batchUpdate request bodies, back-compat) and `plannedOps` (the full ordered " +
+      "log, including writeRange value writes). " +
       "The script is wrapped in `async () => { <your code> }` and awaited; whatever you `return` " +
       "comes back as `result`. Console.log/info/warn/error are captured.",
     inputSchema: {

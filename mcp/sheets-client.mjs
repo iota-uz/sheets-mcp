@@ -44,8 +44,11 @@ export async function spreadsheetsGet(spreadsheetId, { ranges, includeGridData =
   return res.data;
 }
 
-// Dry-run capture: when set, batchUpdate records the request body and returns a
-// synthetic response instead of calling the API. Toggled by the runner.
+// Dry-run capture: when set, every mutating call records a tagged "planned op"
+// into this array and returns a synthetic response instead of calling the API.
+// Toggled by the runner. Tagged entries:
+//   { kind: "batchUpdate", spreadsheetId, requests }
+//   { kind: "valuesUpdate", spreadsheetId, range, values, valueInputOption }
 let dryRunCapture = null;
 
 export function setDryRunMode(capture) {
@@ -62,7 +65,7 @@ export async function batchUpdate(spreadsheetId, requests, { responseIncludeGrid
   }
 
   if (dryRunCapture) {
-    dryRunCapture.push({ spreadsheetId, requests });
+    dryRunCapture.push({ kind: "batchUpdate", spreadsheetId, requests });
     return { spreadsheetId, replies: requests.map(() => ({})) };
   }
 
@@ -120,13 +123,25 @@ export async function developerMetadataSearch(spreadsheetId, filters) {
 /**
  * Update a single value range. Used for ad-hoc cell writes that don't need
  * the full atomicity of batchUpdate.
+ *
+ * Honors dry-run: under capture, the write is recorded and NOT sent (previously
+ * writeRange silently committed even with dryRun: true — issue #7 footgun #1).
  */
 export async function valuesUpdate(spreadsheetId, range, values, { raw = false } = {}) {
+  const valueInputOption = raw ? "RAW" : "USER_ENTERED";
+
+  if (dryRunCapture) {
+    dryRunCapture.push({ kind: "valuesUpdate", spreadsheetId, range, values, valueInputOption });
+    const updatedColumns = values.reduce((m, r) => Math.max(m, Array.isArray(r) ? r.length : 0), 0);
+    const updatedCells = values.reduce((s, r) => s + (Array.isArray(r) ? r.length : 0), 0);
+    return { updatedRange: range, updatedRows: values.length, updatedColumns, updatedCells };
+  }
+
   const sheets = getSheets();
   const res = await sheets.spreadsheets.values.update({
     spreadsheetId,
     range,
-    valueInputOption: raw ? "RAW" : "USER_ENTERED",
+    valueInputOption,
     requestBody: { values },
   });
   return res.data;

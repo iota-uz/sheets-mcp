@@ -16,7 +16,8 @@
  *   - update/delete/format accept an explicit `rows: [...]` to skip find().
  */
 
-import { compileStyle, colLetter } from "./schema.mjs";
+import { compileStyle } from "./schema.mjs";
+import { colLetter, colToIdx, a1ToGridRange } from "./a1.mjs";
 import {
   batchUpdate,
   spreadsheetsGet,
@@ -24,6 +25,22 @@ import {
   valuesGet,
   valuesUpdate,
 } from "./sheets-client.mjs";
+import {
+  buildRepeatCellFormat,
+  buildMerge,
+  buildUnmerge,
+  buildSetBorders,
+  buildAddConditionalFormat,
+  buildFreeze,
+  buildResizeColumns,
+  buildInsertColumns,
+  buildDeleteColumns,
+  buildSort,
+  buildSetFilter,
+  buildFindReplace,
+  buildSetNote,
+  buildSetValidation,
+} from "./requests.mjs";
 
 const META_KEY_IDEMPOTENCY = "sheets-mcp:idempotency";
 
@@ -504,7 +521,11 @@ class Sheet {
     return { deleted: targetRows.length, rows: targetRows };
   }
 
-  async format({ where, rows, set }) {
+  async format({ where, rows, range, set }) {
+    // Arbitrary range / single column / off-header cells: format exactly that range.
+    if (range != null) return this.formatRange(range, set);
+
+    // Whole-row path (backward compatible): style every column of the target rows.
     const targetRows = await this._resolveRows({ rows, where });
     if (targetRows.length === 0) return { formatted: 0, rows: [] };
 
@@ -527,37 +548,170 @@ class Sheet {
     return { formatted: targetRows.length, rows: targetRows };
   }
 
+  /** Format an arbitrary A1 range ("B2:D10", "C:C", "A1") — not limited to whole rows. */
+  async formatRange(a1, style) {
+    const { cellFormat, fields } = compileStyle(style);
+    const grid = a1ToGridRange(this.sheetId, a1);
+    await batchUpdate(this.spreadsheetId, buildRepeatCellFormat(grid, cellFormat, fields));
+    return { formatted: "range", range: a1 };
+  }
+
+  // ── Presentation / structure sugar (all compile to batchUpdate ⇒ dry-run aware) ──
+
+  async merge(range, type = "MERGE_ALL") {
+    await batchUpdate(this.spreadsheetId, buildMerge(a1ToGridRange(this.sheetId, range), type));
+    return { ok: true, range, mergeType: type };
+  }
+
+  async unmerge(range) {
+    await batchUpdate(this.spreadsheetId, buildUnmerge(a1ToGridRange(this.sheetId, range)));
+    return { ok: true, range };
+  }
+
+  async setBorders(range, spec = "all") {
+    await batchUpdate(this.spreadsheetId, buildSetBorders(a1ToGridRange(this.sheetId, range), spec));
+    return { ok: true, range };
+  }
+
+  async addConditionalFormat(range, rule) {
+    await batchUpdate(this.spreadsheetId, buildAddConditionalFormat(a1ToGridRange(this.sheetId, range), rule));
+    return { ok: true, range };
+  }
+
+  async freeze({ rows, cols } = {}) {
+    await batchUpdate(this.spreadsheetId, buildFreeze(this.sheetId, { rows, cols }));
+    return { ok: true, rows, cols };
+  }
+
+  /** range: a column range ("B:D" / "C:C"). opts: { width } | { auto: true }. */
+  async resizeColumns(range, opts = {}) {
+    const grid = a1ToGridRange(this.sheetId, range);
+    if (grid.startColumnIndex == null) throw new Error(`resizeColumns: "${range}" must specify columns`);
+    const endCol = grid.endColumnIndex ?? grid.startColumnIndex + 1;
+    await batchUpdate(this.spreadsheetId, buildResizeColumns(this.sheetId, grid.startColumnIndex, endCol, opts));
+    return { ok: true, range };
+  }
+
+  async insertColumns(at, count = 1) {
+    const idx = this._colPos(at);
+    await batchUpdate(this.spreadsheetId, buildInsertColumns(this.sheetId, idx, count));
+    this._invalidateStructure();
+    return { ok: true, at: idx, count };
+  }
+
+  async deleteColumns(at, count = 1) {
+    const idx = this._colPos(at);
+    await batchUpdate(this.spreadsheetId, buildDeleteColumns(this.sheetId, idx, count));
+    this._invalidateStructure();
+    return { ok: true, at: idx, count };
+  }
+
+  /** specs: [{ column: header|letter|index, order?: "ASC"|"DESC" }]. */
+  async sort(range, specs) {
+    const grid = a1ToGridRange(this.sheetId, range);
+    const norm = (specs || []).map(s => ({
+      dimensionIndex: s.dimensionIndex != null ? s.dimensionIndex : this._colPos(s.column),
+      order: s.order,
+    }));
+    await batchUpdate(this.spreadsheetId, buildSort(grid, norm));
+    return { ok: true, range };
+  }
+
+  async setFilter(range) {
+    await batchUpdate(this.spreadsheetId, buildSetFilter(a1ToGridRange(this.sheetId, range)));
+    return { ok: true, range };
+  }
+
+  /** Scoped to THIS sheet by default. opts: { range?, allSheets?, matchCase?, matchEntireCell?, searchByRegex?, includeFormulas? }. */
+  async findReplace(find, replacement, opts = {}) {
+    const frOpts = {
+      find,
+      replacement,
+      matchCase: opts.matchCase,
+      matchEntireCell: opts.matchEntireCell,
+      searchByRegex: opts.searchByRegex,
+      includeFormulas: opts.includeFormulas,
+    };
+    if (opts.allSheets) frOpts.allSheets = true;
+    else if (opts.range) frOpts.range = a1ToGridRange(this.sheetId, opts.range);
+    else frOpts.sheetId = this.sheetId;
+
+    const res = await batchUpdate(this.spreadsheetId, buildFindReplace(frOpts));
+    return res?.replies?.[0]?.findReplace ?? { ok: true };
+  }
+
+  async setNote(cell, text) {
+    await batchUpdate(this.spreadsheetId, buildSetNote(a1ToGridRange(this.sheetId, cell), text));
+    return { ok: true, cell };
+  }
+
+  /** Column position from a header name, a column letter, or a 0-based index. */
+  _colPos(at) {
+    if (typeof at === "number") return at;
+    const k = normHeader(at);
+    if (this.headerToIdx.has(k)) return this.headerToIdx.get(k);
+    return colToIdx(String(at));
+  }
+
+  /** After a column insert/delete the cached headers/width are stale — drop caches. */
+  _invalidateStructure() {
+    this._nextRowCache = null;
+    this._idempotencyMap = null;
+    clearCache();
+  }
+
+  /**
+   * Set or clear a column's data validation. Applies to the whole column below
+   * the header row. spec.type is a Sheets ConditionType:
+   *   ONE_OF_LIST { values, strict?, showCustomUi? }      (dropdown)
+   *   ONE_OF_RANGE { range, strict? }                     (dropdown from a range)
+   *   NUMBER_BETWEEN/NOT_BETWEEN { min, max }
+   *   NUMBER_GREATER/LESS/EQ/… { value }
+   *   DATE_BETWEEN { min, max } | DATE_AFTER/BEFORE/… { value } | DATE_IS_VALID {}
+   *   TEXT_CONTAINS/STARTS_WITH/EQ/… { value } | TEXT_IS_EMAIL/URL {}
+   *   BOOLEAN {}                                          (checkbox)
+   *   CUSTOM_FORMULA { formula }
+   *   "clear" | { clear: true }                           (remove validation)
+   */
   async setValidation(header, spec) {
     const idx = this._col(header);
-    if (spec.type !== "ONE_OF_LIST") {
-      throw new Error(`setValidation: unsupported type "${spec.type}" — only ONE_OF_LIST for now`);
-    }
-    const requests = [{
-      setDataValidation: {
-        range: {
-          sheetId: this.sheetId,
-          startRowIndex: this.headerRow,
-          startColumnIndex: idx,
-          endColumnIndex: idx + 1,
-        },
-        rule: {
-          condition: {
-            type: "ONE_OF_LIST",
-            values: spec.values.map(v => ({ userEnteredValue: String(v) })),
-          },
-          showCustomUi: true,
-          strict: spec.strict ?? false,
-        },
-      },
-    }];
-    await batchUpdate(this.spreadsheetId, requests);
+    const range = {
+      sheetId: this.sheetId,
+      startRowIndex: this.headerRow,
+      startColumnIndex: idx,
+      endColumnIndex: idx + 1,
+    };
+    await batchUpdate(this.spreadsheetId, buildSetValidation(range, spec));
 
-    this._validations.set(normHeader(header), {
-      type: "ONE_OF_LIST",
-      values: spec.values.map(v => String(v)),
-      strict: spec.strict ?? false,
-    });
+    // Keep the in-memory validation cache (consulted by insert/update) in sync.
+    // Only ONE_OF_LIST is enforced locally; other types and clears just evict.
+    const k = normHeader(header);
+    if (spec?.type === "clear" || spec?.clear === true) {
+      this._validations.delete(k);
+    } else if (spec.type === "ONE_OF_LIST") {
+      this._validations.set(k, {
+        type: "ONE_OF_LIST",
+        values: spec.values.map(v => String(v)),
+        strict: spec.strict ?? false,
+      });
+    } else {
+      this._validations.delete(k);
+    }
     return { ok: true };
+  }
+
+  /**
+   * Richer read: pull formatting, notes, merges, validation and hyperlinks for
+   * an arbitrary A1 range. Returns { data, merges } from the Sheets grid data.
+   */
+  async readFormatting(a1, { fields } = {}) {
+    const range = `${quoteSheetName(this.name)}!${a1}`;
+    const mask = fields ||
+      "sheets(merges,data(startRow,startColumn,rowData(values(" +
+      "formattedValue,userEnteredValue,effectiveFormat,note,dataValidation,hyperlink))))";
+    const meta = await spreadsheetsGet(this.spreadsheetId, { ranges: [range], includeGridData: true, fields: mask });
+    const sheet = (meta.sheets || [])[0] || {};
+    return { data: sheet.data || [], merges: sheet.merges || [] };
   }
 
   async readRange(a1, { valueRender = "UNFORMATTED_VALUE" } = {}) {
@@ -580,7 +734,7 @@ class Sheet {
   }
 }
 
-function normHeader(s) {
+export function normHeader(s) {
   return String(s ?? "").trim().toLowerCase().replace(/ё/g, "е");
 }
 

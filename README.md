@@ -71,7 +71,7 @@ Execute JavaScript against the typed Sheet API in a sandboxed `vm` context. The 
 |-----------------|-----------|---------|--------------------------------------------------------|
 | `spreadsheetId` | `string`  | —       | **Required.** Bound to the `sheets` global for this call. |
 | `code`          | `string`  | —       | **Required.** JS to execute. Has access to `sheets`, `console`, JS builtins. |
-| `dryRun`        | `boolean` | `false` | If true, `batchUpdate` calls are recorded into `planned[]` instead of being sent. |
+| `dryRun`        | `boolean` | `false` | If true, every mutation is recorded — not sent. Returned as `planned[]` (batchUpdate bodies) and `plannedOps[]` (full ordered log, incl. `writeRange` value writes). |
 | `timeoutMs`     | `number`  | `30000` | Execution timeout in milliseconds.                     |
 
 The `sheets` global (bound to the call's `spreadsheetId`):
@@ -79,6 +79,19 @@ The `sheets` global (bound to the call's `spreadsheetId`):
 ```ts
 sheets.sheet(name: string, opts?: { headerRow?: number }): Promise<Sheet>
 sheets.spreadsheetId(): string
+
+// Structural ops — create / manage tabs (no human in the browser needed)
+sheets.addSheet(title, opts?): Promise<{ sheetId, title }>
+   opts: { rows?, cols?, index?, tabColor?, frozenRows?, frozenCols? }
+sheets.deleteSheet(nameOrId): Promise<{ ok }>
+sheets.renameSheet(nameOrId, newTitle): Promise<{ ok }>
+sheets.duplicateSheet(nameOrId, newTitle?): Promise<{ sheetId }>
+
+// Raw escape hatch — full Sheets v4 power for anything not covered by the sugar
+sheets.batchUpdate(requests): Promise<...>          // any Request[], dry-run aware
+sheets.valuesBatchGet(ranges, opts?): Promise<...>  // multi-range read, one round trip
+sheets.getSpreadsheet(opts?): Promise<...>          // metadata: all sheets, named ranges, …
+sheets.developerMetadataSearch(filters): Promise<...>
 ```
 
 The `Sheet`:
@@ -99,14 +112,35 @@ sheet.insert(record, opts?): Promise<{ row, inserted, idempotencyHit }>
 sheet.find(where): Promise<Array<{ row, "Header": value, ... }>>
 sheet.update({ where?, rows?, set }): Promise<{ updated, rows }>
 sheet.delete({ where?, rows? }): Promise<{ deleted, rows }>
-sheet.format({ where?, rows?, set }): Promise<{ formatted, rows }>
-sheet.setValidation(header, { type, values, strict? }): Promise<{ ok }>
+
+// Formatting & presentation
+sheet.format({ where?, rows?, range?, set }): Promise<{ formatted, rows }>
+   where/rows style whole rows; pass `range` (A1) to style an arbitrary range.
+sheet.formatRange(a1, style): Promise<...>          // any range/column: "B2:D10", "C:C"
+sheet.merge(range, type?) / sheet.unmerge(range)    // type: MERGE_ALL|MERGE_COLUMNS|MERGE_ROWS
+sheet.setBorders(range, spec)                       // "all" | "outer" | "DASHED" | { top?, …, style?, color? }
+sheet.addConditionalFormat(range, rule)             // { condition, format } | { gradient: { min, mid?, max } }
+sheet.freeze({ rows?, cols? })
+sheet.resizeColumns(range, { width } | { auto: true })
+sheet.insertColumns(at, count?) / sheet.deleteColumns(at, count?)   // at: header | letter | index
+sheet.sort(range, [{ column, order?: "ASC"|"DESC" }])
+sheet.setFilter(range)
+sheet.findReplace(find, replace, opts?)             // this sheet by default; opts.range / opts.allSheets
+sheet.setNote(cell, text)
+
+sheet.setValidation(header, spec): Promise<{ ok }>
+   spec.type ∈ ONE_OF_LIST { values } | ONE_OF_RANGE { range } | BOOLEAN {} |
+   NUMBER_BETWEEN { min, max } | NUMBER_GREATER/LESS/EQ { value } |
+   DATE_BETWEEN { min, max } | DATE_AFTER/BEFORE { value } |
+   TEXT_CONTAINS/EQ { value } | CUSTOM_FORMULA { formula } | "clear"
+   (+ optional strict?, showCustomUi?)
 
 sheet.readRange(a1, { valueRender? }): Promise<any[][]>
+sheet.readFormatting(a1, opts?): Promise<{ data, merges }>   // formatting, notes, merges, validation
 sheet.writeRange(a1, values2d, { raw? }): Promise<{ updatedRange, updatedCells, ... }>
 ```
 
-Pass `rows: [123, 456]` to `update/delete/format` to skip the `find()` lookup when row numbers are already known.
+Pass `rows: [123, 456]` to `update/delete/format` to skip the `find()` lookup when row numbers are already known. Every mutating method compiles to `batchUpdate` (or a guarded value write) and therefore respects `dryRun`.
 
 **Records use the sheet's actual header text** — no role/schema indirection.
 
@@ -115,9 +149,9 @@ Pass `rows: [123, 456]` to `update/delete/format` to skip the `find()` lookup wh
 - `{row}` — the new row's actual number, resolved at write time
 - `{col:Header}` — the A1 column letter for the column with that exact header
 
-**Idempotency**: pass an opaque `idempotencyKey` as a string. The MCP stores it as `DeveloperMetadata` (`iota:idempotency` namespace, `PROJECT` visibility) on the new row. Re-running the same insert performs a metadata search first and returns the existing row with `inserted: false, idempotencyHit: <row>` instead of duplicating.
+**Idempotency**: pass an opaque `idempotencyKey` as a string. The MCP stores it as `DeveloperMetadata` (`sheets-mcp:idempotency` namespace, `PROJECT` visibility) on the new row. Re-running the same insert performs a metadata search first and returns the existing row with `inserted: false, idempotencyHit: <row>` instead of duplicating.
 
-**Validation**: pulled from in-sheet data validation rules. Set them once with `sheet.setValidation(header, { type: "ONE_OF_LIST", values, strict })`. After that, both the spreadsheet UI and `sheet.insert/update` reject invalid values pre-flight.
+**Validation**: set with `sheet.setValidation(header, spec)` — `ONE_OF_LIST`/`ONE_OF_RANGE` dropdowns, `BOOLEAN` checkboxes, `NUMBER_*`/`DATE_*`/`TEXT_*` conditions, `CUSTOM_FORMULA`, or `"clear"` to remove a rule. `ONE_OF_LIST` rules are also enforced pre-flight by `sheet.insert/update` (both the spreadsheet UI and the MCP reject invalid values).
 
 `StyleObject` keys: `backgroundColor`, `horizontalAlignment`, `numberFormat`, `textFormat: { bold, italic, fontSize, foregroundColor }`, `wrapStrategy`.
 
@@ -167,9 +201,20 @@ const accts  = await sheets.sheet("accounts", { headerRow: 2 });
 return accts.find({ "Short name": "Main USD" });
 ```
 
+**Create and structure a brand-new tab (no human in the browser):**
+
+```js
+await sheets.addSheet("обязательства", { tabColor: "#34a853", frozenRows: 1 });
+const s = await sheets.sheet("обязательства");
+await s.formatRange("A1:D1", { textFormat: { bold: true }, backgroundColor: "#f1f3f4" });
+await s.setBorders("A1:D50", "all");
+await s.setValidation("Status", { type: "BOOLEAN" });
+await s.freeze({ rows: 1 });
+```
+
 **Dry-run preview:**
 
-Pass `dryRun: true` to `sheets_exec` to capture the planned `batchUpdate` request bodies without committing.
+Pass `dryRun: true` to `sheets_exec` to capture every intended mutation without committing. The response carries `planned[]` (the `batchUpdate` request bodies — same shape as before) and `plannedOps[]` (the full ordered log, including `writeRange` value writes).
 
 ## Architecture
 
@@ -183,6 +228,16 @@ agent JS  →  sheets_exec  →  vm sandbox  →  Sheet.insert  →  batchUpdate
 ```
 
 `Sheet.insert` produces a single batch with `insertDimension` + `updateCells` (with formulas referencing the new row's actual position) + an optional `createDeveloperMetadata` idempotency token. One round trip, atomic.
+
+The A1↔GridRange math (`mcp/a1.mjs`) and the Sheets v4 request builders (`mcp/requests.mjs`) are pure and isolated, so the structural/presentation surface stays testable without hitting Google.
+
+## Tests
+
+```bash
+npm test   # node --test — unit tests for the A1 grammar + request builders
+```
+
+No network or credentials needed; the tests cover the pure layers (`a1.mjs`, `requests.mjs`).
 
 ## Release (maintainers)
 
