@@ -101,13 +101,12 @@ sheet.describe(): { sheet, sheetId, headerRow, rowCount, headers }
 
 sheet.insertMany(records, opts?): Promise<{ inserted, skipped, rows }>
    records: Array<{ "Header text": value | "=formula" }>
-   opts:    { idempotencyKey?: (record, i) => string,
-              format?: StyleObject, dryRun?: boolean }
+   opts:    { idempotencyKey?: (record, i) => string, format?: StyleObject }
    N records → ONE batchUpdate. Use this for any batch.
 
 sheet.insert(record, opts?): Promise<{ row, inserted, idempotencyHit }>
    Sugar over insertMany for one record.
-   opts: { idempotencyKey?: string, format?: StyleObject, dryRun?: boolean }
+   opts: { idempotencyKey?: string, format?: StyleObject }
 
 sheet.find(where): Promise<Array<{ row, "Header": value, ... }>>
 sheet.update({ where?, rows?, set }): Promise<{ updated, rows }>
@@ -239,12 +238,18 @@ npm test   # node --test — unit tests for the A1 grammar + request builders
 
 No network or credentials needed; the tests cover the pure layers (`a1.mjs`, `requests.mjs`) plus the dry-run wiring (`integration.test.mjs`).
 
-## Known limitations
+## Isolation & correctness
 
-- **Dry-run capture is process-global.** Concurrent `sheets_exec` calls in the same server process share one capture buffer; treat exec as single-flight (a future change can scope it per-call via `AsyncLocalStorage`).
-- **Stale handles after structural tab changes.** A `Sheet` obtained before `sheets.renameSheet`/`deleteSheet` keeps its old name and will build A1 ranges against it. Re-fetch with `sheets.sheet(name)` after renaming/deleting a tab. (`insertColumns`/`deleteColumns` self-refresh the handle they're called on.)
-- **Idempotency tokens are keyed by sheet title.** Renaming a tab orphans its existing `idempotencyKey` tokens, so a re-insert after a rename can duplicate. Keep idempotency keys stable and avoid renaming tabs that rely on them.
-- **Duplicate header texts are ambiguous.** Headers that collide after normalization (case-insensitive, `ё`→`е`) resolve to the last matching column. Give columns distinct header text.
+Each `sheets_exec` call runs against its own client and handle registry, so:
+
+- **Concurrent execs are isolated.** Dry-run captures and the per-sheet handle cache are scoped to one exec — overlapping calls never see each other's writes.
+- **Handles track tab identity.** `sheets.renameSheet` updates any handle you're already holding (so it keeps reading/writing the right tab); `sheets.deleteSheet` marks held handles dead — calling one throws `Sheet "<name>" was deleted` instead of silently hitting the wrong tab.
+- **Idempotency survives a rename.** Tokens are scoped to a row by `sheetId`, not by tab title.
+- **Ambiguous headers fail loud.** If two columns share a header (after case/`ё`→`е` normalization), a write keyed by it throws `Ambiguous header "<h>" — appears in columns B, E` rather than guessing. `describe()` still lists every column so you can spot the dup.
+
+### Known limitation
+
+- **Dry-run can't read a tab you changed earlier in the same script.** Under `dryRun: true`, structural ops (`addSheet`/`renameSheet`/`deleteSheet`) are *captured*, not executed, but reads (`find`, `readRange`, `_getNextRow`) hit the real spreadsheet. So renaming a tab then reading it in the same dry-run script fails — the tab isn't really renamed yet. Run such flows for real (or split the preview).
 
 ## Release (maintainers)
 

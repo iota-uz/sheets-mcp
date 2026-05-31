@@ -10,19 +10,20 @@
  */
 
 import vm from "vm";
-import { clearCache } from "./sheet.mjs";
+import { makeClient } from "./sheets-client.mjs";
 import { makeSheetsApi } from "./sheets-api.mjs";
-import { setDryRunMode } from "./sheets-client.mjs";
 
 export async function exec(spreadsheetId, code, { dryRun = false, timeoutMs = 30000 } = {}) {
   if (!spreadsheetId) throw new Error("exec requires a spreadsheetId");
 
   const stdout = [];
   const stderr = [];
-  // One ordered log of tagged planned ops ({ kind: "batchUpdate" | "valuesUpdate", ... }).
-  const captured = [];
-
-  const sheets = makeSheetsApi(spreadsheetId);
+  // Per-exec dry-run capture: an ordered log of tagged planned ops
+  // ({ kind: "batchUpdate" | "valuesUpdate", ... }), or null when committing.
+  // Held by this exec's client only, so concurrent execs never interfere.
+  const capture = dryRun ? [] : null;
+  const client = makeClient({ capture });
+  const sheets = makeSheetsApi(spreadsheetId, client);
 
   const sandboxConsole = {
     log:   (...a) => stdout.push(a.map(stringify).join(" ")),
@@ -30,11 +31,6 @@ export async function exec(spreadsheetId, code, { dryRun = false, timeoutMs = 30
     warn:  (...a) => stderr.push(a.map(stringify).join(" ")),
     error: (...a) => stderr.push(a.map(stringify).join(" ")),
   };
-
-  if (dryRun) {
-    setDryRunMode(captured);
-    clearCache();
-  }
 
   const ctx = vm.createContext({
     sheets,
@@ -61,8 +57,6 @@ export async function exec(spreadsheetId, code, { dryRun = false, timeoutMs = 30
     // Clear the timeout timer so a fast script doesn't leave it dangling and
     // hold the event loop open for the full timeoutMs.
     if (timeoutTimer) clearTimeout(timeoutTimer);
-    if (dryRun) setDryRunMode(null);
-    clearCache();
   }
 
   return {
@@ -73,12 +67,12 @@ export async function exec(spreadsheetId, code, { dryRun = false, timeoutMs = 30
     ...(error && { error }),
     ...(dryRun && {
       dryRun: true,
-      // Back-compat: `planned` stays the batchUpdate request bodies, same shape as before.
-      planned: captured
+      // `planned` = the batchUpdate request bodies; `plannedOps` = the full
+      // ordered log of every intended mutation (incl. writeRange value writes).
+      planned: capture
         .filter(e => e.kind === "batchUpdate")
         .map(({ spreadsheetId: id, requests }) => ({ spreadsheetId: id, requests })),
-      // Full, honest log of every intended mutation in order (incl. writeRange value writes).
-      plannedOps: captured,
+      plannedOps: capture,
     }),
   };
 }

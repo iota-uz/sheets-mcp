@@ -1,16 +1,15 @@
 /**
- * No-network integration tests for the dry-run wiring: runner → sheets-api
- * factory → tagged capture in the low-level client. These exercise the layers
- * the pure unit tests don't, and intentionally avoid any path that would call
- * the real Google client (under dry-run, batchUpdate/valuesUpdate never touch
- * the network, and addSheet does not resolve a sheet name).
+ * No-network integration tests for the dry-run wiring: runner → makeClient
+ * capture → makeSheetsApi. Every path here avoids the real Google client (under
+ * dry-run, batchUpdate/valuesUpdate never touch the network, and addSheet does
+ * not resolve a sheet name).
  */
 import { test } from "node:test";
 import assert from "node:assert/strict";
 import { exec } from "./runner.mjs";
-import { setDryRunMode, valuesUpdate, batchUpdate } from "./sheets-client.mjs";
+import { makeClient } from "./sheets-client.mjs";
 
-test("runner dry-run — addSheet is captured, not committed, and returns a placeholder", async () => {
+test("runner dry-run — addSheet is captured, not committed, returns a placeholder", async () => {
   const out = await exec(
     "FAKE_ID",
     `return await sheets.addSheet("обязательства", { tabColor: "#34a853", frozenRows: 1 });`,
@@ -19,14 +18,32 @@ test("runner dry-run — addSheet is captured, not committed, and returns a plac
   assert.equal(out.ok, true);
   assert.deepEqual(out.result, { sheetId: null, title: "обязательства", dryRun: true });
 
-  // back-compat `planned` holds the batchUpdate request body…
   assert.equal(out.planned.length, 1);
   const req = out.planned[0].requests[0];
   assert.equal(req.addSheet.properties.title, "обязательства");
   assert.equal(req.addSheet.properties.gridProperties.frozenRowCount, 1);
-
-  // …and the full tagged log agrees.
   assert.deepEqual(out.plannedOps.map(e => e.kind), ["batchUpdate"]);
+});
+
+test("runner dry-run — raw escape hatch batchUpdate is captured, not committed", async () => {
+  const out = await exec(
+    "FAKE_ID",
+    `return await sheets.batchUpdate([{ addSheet: { properties: { title: "raw" } } }]);`,
+    { dryRun: true },
+  );
+  assert.equal(out.ok, true);
+  assert.equal(out.plannedOps.length, 1);
+  assert.equal(out.plannedOps[0].requests[0].addSheet.properties.title, "raw");
+});
+
+test("concurrent dry-run execs do not cross-contaminate captures (limitation #1)", async () => {
+  const [a, b] = await Promise.all([
+    exec("ID_A", `await sheets.addSheet("A1"); return await sheets.addSheet("A2");`, { dryRun: true }),
+    exec("ID_B", `return await sheets.addSheet("B1");`, { dryRun: true }),
+  ]);
+  const titles = (o) => o.plannedOps.map(e => e.requests[0].addSheet.properties.title);
+  assert.deepEqual(titles(a), ["A1", "A2"]);
+  assert.deepEqual(titles(b), ["B1"]);
 });
 
 test("runner — a thrown script error is returned as ok:false, not a crash", async () => {
@@ -35,16 +52,21 @@ test("runner — a thrown script error is returned as ok:false, not a crash", as
   assert.equal(out.error.message, "boom");
 });
 
-test("valuesUpdate honors dry-run — captured + synthetic, never sent (footgun #1)", async () => {
-  const cap = [];
-  setDryRunMode(cap);
-  try {
-    const res = await valuesUpdate("ID", "Sheet1!A1:B1", [["x", "y"]]);
-    await batchUpdate("ID", [{ addSheet: { properties: { title: "t" } } }]);
-    assert.deepEqual(res, { updatedRange: "Sheet1!A1:B1", updatedRows: 1, updatedColumns: 2, updatedCells: 2 });
-    assert.deepEqual(cap.map(e => e.kind), ["valuesUpdate", "batchUpdate"]);
-    assert.equal(cap[0].valueInputOption, "USER_ENTERED");
-  } finally {
-    setDryRunMode(null);
+test("makeClient capture — valuesUpdate + batchUpdate recorded + synthetic, never sent", async () => {
+  const capture = [];
+  const client = makeClient({ capture });
+  const res = await client.valuesUpdate("ID", "Sheet1!A1:B1", [["x", "y"]]);
+  await client.batchUpdate("ID", [{ addSheet: { properties: { title: "t" } } }]);
+
+  assert.deepEqual(res, { updatedRange: "Sheet1!A1:B1", updatedRows: 1, updatedColumns: 2, updatedCells: 2 });
+  assert.deepEqual(capture.map(e => e.kind), ["valuesUpdate", "batchUpdate"]);
+  assert.equal(capture[0].valueInputOption, "USER_ENTERED");
+});
+
+test("makeClient with no capture builds a real-call client (reads bound)", () => {
+  const client = makeClient();
+  // Shape check only — these would hit Google if invoked; just assert the surface.
+  for (const m of ["batchUpdate", "valuesUpdate", "getSpreadsheet", "spreadsheetsGet", "valuesGet", "valuesBatchGet", "developerMetadataSearch"]) {
+    assert.equal(typeof client[m], "function", `client.${m}`);
   }
 });

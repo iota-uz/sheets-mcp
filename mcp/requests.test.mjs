@@ -7,6 +7,7 @@ import {
   buildAddConditionalFormat, buildFreeze, buildResizeColumns,
   buildInsertColumns, buildDeleteColumns, buildSort, buildSetFilter,
   buildFindReplace, buildSetNote, buildSetValidation, conditionFromSpec,
+  buildDeveloperMetadata, META_KEY_IDEMPOTENCY,
 } from "./requests.mjs";
 
 const RANGE = { sheetId: 1, startRowIndex: 1, endRowIndex: 10, startColumnIndex: 1, endColumnIndex: 4 };
@@ -123,6 +124,19 @@ test("buildFindReplace — scope precedence + flags", () => {
 test("buildSetNote", () => {
   assert.deepEqual(buildSetNote(RANGE, "hi"),
     [{ repeatCell: { range: RANGE, cell: { note: "hi" }, fields: "note" } }]);
+});
+
+test("buildDeveloperMetadata — value is the raw key (no title prefix), row-scoped", () => {
+  assert.deepEqual(buildDeveloperMetadata(7, "k1", 4), {
+    createDeveloperMetadata: {
+      developerMetadata: {
+        metadataKey: META_KEY_IDEMPOTENCY,
+        metadataValue: "k1",
+        location: { dimensionRange: { sheetId: 7, dimension: "ROWS", startIndex: 4, endIndex: 5 } },
+        visibility: "PROJECT",
+      },
+    },
+  });
 });
 
 test("conditionFromSpec — argument sourcing per type", () => {

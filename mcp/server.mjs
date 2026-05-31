@@ -21,8 +21,8 @@ import {
 } from "@modelcontextprotocol/sdk/types.js";
 
 import { exec } from "./runner.mjs";
-import { sheet } from "./sheet.mjs";
-import { getSpreadsheet } from "./sheets-client.mjs";
+import { createSheet } from "./sheet.mjs";
+import { getSpreadsheet, makeClient } from "./sheets-client.mjs";
 import { readChannelMessages } from "./discord.mjs";
 
 const SHEETS_LIB_DOC = `
@@ -49,15 +49,14 @@ Sheet API:
 
   sheet.insertMany(records, opts?)            → Promise<{ inserted, skipped, rows }>
         records: Array<{ "Header": value | "=formula" }>
-        opts:    { idempotencyKey?: (record, i) => string,
-                   format?: StyleObject, dryRun?: boolean }
+        opts:    { idempotencyKey?: (record, i) => string, format?: StyleObject }
         ALL records compile to ONE batchUpdate (insertDimension + updateCells +
         per-row idempotency tokens). Use this for batches — it's ~N× faster
         than a loop of insert().
 
   sheet.insert(record, opts?)                 → Promise<{ row, inserted, idempotencyHit }>
         Sugar over insertMany for one record.
-        opts: { idempotencyKey?: string, format?: StyleObject, dryRun?: boolean }
+        opts: { idempotencyKey?: string, format?: StyleObject }
 
         Formula values use {row} and {col:HeaderName} placeholders.
         Validation runs against in-sheet data validation rules (configure via setValidation).
@@ -177,7 +176,7 @@ const handlers = {
         sheets: meta.sheets.map(s => ({ title: s.properties.title, sheetId: s.properties.sheetId })),
       };
     }
-    const s = await sheet(a.spreadsheetId, a.sheet, { headerRow: a.headerRow });
+    const s = await createSheet(a.spreadsheetId, a.sheet, { headerRow: a.headerRow }, makeClient());
     return s.describe();
   },
 

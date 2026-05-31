@@ -10,6 +10,9 @@
 
 import { compileStyle, colorToRgbFloat } from "./schema.mjs";
 
+// DeveloperMetadata key used for idempotency tokens (one per inserted row).
+export const META_KEY_IDEMPOTENCY = "sheets-mcp:idempotency";
+
 // ── Structural (spreadsheet & sheet) ────────────────────────────────────────
 
 export function buildAddSheet(opts = {}) {
@@ -43,6 +46,26 @@ export function buildDuplicateSheet(sourceSheetId, opts = {}) {
   if (opts.newTitle != null) dup.newSheetName = opts.newTitle;
   if (opts.index != null) dup.insertSheetIndex = opts.index;
   return [{ duplicateSheet: dup }];
+}
+
+/**
+ * One idempotency token attached to a row (0-based startIndex). The token value
+ * is the raw key — scoped to a row of a specific sheetId via its location, so it
+ * survives a tab rename (issue #7 limitation #3) and never needs a title prefix.
+ */
+export function buildDeveloperMetadata(sheetId, key, startIndex) {
+  return {
+    createDeveloperMetadata: {
+      developerMetadata: {
+        metadataKey: META_KEY_IDEMPOTENCY,
+        metadataValue: String(key),
+        location: {
+          dimensionRange: { sheetId, dimension: "ROWS", startIndex, endIndex: startIndex + 1 },
+        },
+        visibility: "PROJECT",
+      },
+    },
+  };
 }
 
 // ── Formatting / presentation ───────────────────────────────────────────────
