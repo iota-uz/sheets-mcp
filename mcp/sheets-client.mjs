@@ -26,7 +26,10 @@ async function getSpreadsheet(spreadsheetId, { includeGridData = false } = {}) {
   const res = await sheets.spreadsheets.get({
     spreadsheetId,
     includeGridData,
-    fields: "spreadsheetId,sheets(properties(sheetId,title,gridProperties),developerMetadata),developerMetadata",
+    fields:
+      "spreadsheetId,sheets(properties(sheetId,title,gridProperties)," +
+      "tables(tableId,name,range,columnProperties(columnIndex,columnName,columnType))," +
+      "merges,developerMetadata),developerMetadata",
   });
   return res.data;
 }
@@ -134,8 +137,27 @@ async function valuesUpdate(spreadsheetId, range, values, { raw = false } = {}) 
  * Tagged capture entries:
  *   { kind: "batchUpdate", spreadsheetId, requests }
  *   { kind: "valuesUpdate", spreadsheetId, range, values, valueInputOption }
+ *
+ * Under capture, addSheet/duplicateSheet/addTable replies carry a synthetic
+ * PLACEHOLDER id (negative sheetId, "dryrun:N" tableId) so a dependent op later
+ * in the same dry-run script can reference the not-yet-real object and still be
+ * planned (issue #10 #8). Reads of that virtual object still can't be previewed.
  */
 export function makeClient({ capture = null } = {}) {
+  let placeholderSeq = 0;
+  const syntheticReply = (r) => {
+    if (r.addSheet) {
+      return { addSheet: { properties: { ...(r.addSheet.properties || {}), sheetId: -(++placeholderSeq) } } };
+    }
+    if (r.duplicateSheet) {
+      return { duplicateSheet: { properties: { sheetId: -(++placeholderSeq), title: r.duplicateSheet.newSheetName ?? null } } };
+    }
+    if (r.addTable) {
+      return { addTable: { table: { ...(r.addTable.table || {}), tableId: `dryrun:${++placeholderSeq}` } } };
+    }
+    return {};
+  };
+
   return {
     async batchUpdate(spreadsheetId, requests, opts = {}) {
       if (!Array.isArray(requests) || requests.length === 0) {
@@ -143,7 +165,7 @@ export function makeClient({ capture = null } = {}) {
       }
       if (capture) {
         capture.push({ kind: "batchUpdate", spreadsheetId, requests });
-        return { spreadsheetId, replies: requests.map(() => ({})) };
+        return { spreadsheetId, replies: requests.map(syntheticReply) };
       }
       return batchUpdate(spreadsheetId, requests, opts);
     },

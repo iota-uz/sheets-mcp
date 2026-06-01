@@ -48,6 +48,63 @@ export function buildDuplicateSheet(sourceSheetId, opts = {}) {
   return [{ duplicateSheet: dup }];
 }
 
+// ── Tables (native Sheets v4 Table resource) ────────────────────────────────
+
+// Friendly aliases → Sheets v4 ColumnType. Unknown values pass through uppercased
+// so any current/future enum (TEXT, DOUBLE, CURRENCY, PERCENT, DATE, TIME,
+// DATE_TIME, BOOLEAN, DROPDOWN, …) works without a hardcoded allowlist.
+const COLUMN_TYPE_ALIASES = { NUMBER: "DOUBLE", BOOL: "BOOLEAN", LIST: "DROPDOWN" };
+
+/** A table column's DataValidationRule from a friendly validation spec. */
+export function buildColumnValidationRule(spec) {
+  const rule = { condition: conditionFromSpec(spec), strict: spec.strict ?? false };
+  if (spec.showCustomUi !== undefined) rule.showCustomUi = spec.showCustomUi;
+  if (spec.inputMessage) rule.inputMessage = spec.inputMessage;
+  return rule;
+}
+
+/**
+ * Compile friendly column specs into Sheets v4 Table columnProperties.
+ *   columns: [{ name, type?, values?, validation? }]
+ *     type     → columnType (NUMBER→DOUBLE etc.; else uppercased passthrough)
+ *     values   → dropdown choices: implies DROPDOWN + a ONE_OF_LIST rule
+ *     validation → an explicit conditionFromSpec-style spec → dataValidationRule
+ */
+export function compileTableColumns(columns = []) {
+  return columns.map((c, i) => {
+    const col = {
+      columnIndex: c.columnIndex ?? i,
+      columnName: c.name ?? c.columnName ?? "",
+    };
+    let type = c.type ?? c.columnType;
+    if (type != null) {
+      type = String(type).toUpperCase();
+      col.columnType = COLUMN_TYPE_ALIASES[type] ?? type;
+    }
+    if (Array.isArray(c.values) && c.values.length > 0) {
+      if (col.columnType == null) col.columnType = "DROPDOWN";
+      col.dataValidationRule = buildColumnValidationRule({ type: "ONE_OF_LIST", values: c.values });
+    } else if (c.validation) {
+      col.dataValidationRule = buildColumnValidationRule(c.validation);
+    }
+    return col;
+  });
+}
+
+/** table: { name, range: GridRange, columnProperties, tableId?, rowsProperties? }. */
+export function buildAddTable(table) {
+  return [{ addTable: { table } }];
+}
+
+/** table: { tableId, ...changed fields }. fields: update mask (e.g. "name,columnProperties"). */
+export function buildUpdateTable(table, fields) {
+  return [{ updateTable: { table, fields } }];
+}
+
+export function buildDeleteTable(tableId) {
+  return [{ deleteTable: { tableId } }];
+}
+
 /**
  * One idempotency token attached to a row (0-based startIndex). The token value
  * is the raw key — scoped to a row of a specific sheetId via its location, so it
@@ -194,6 +251,29 @@ export function buildDeleteColumns(sheetId, at, count = 1) {
   return [{ deleteDimension: { range: { sheetId, dimension: "COLUMNS", startIndex: at, endIndex: at + count } } }];
 }
 
+/** Set row heights (0-based, half-open row range) to pixelSize. */
+export function buildSetRowHeight(sheetId, startRow, endRow, pixelSize) {
+  return [{
+    updateDimensionProperties: {
+      range: { sheetId, dimension: "ROWS", startIndex: startRow, endIndex: endRow },
+      properties: { pixelSize },
+      fields: "pixelSize",
+    },
+  }];
+}
+
+/** Copy ONLY the formatting from sourceRange onto destRange (both GridRange). */
+export function buildCopyFormat(sourceRange, destRange) {
+  return [{
+    copyPaste: {
+      source: sourceRange,
+      destination: destRange,
+      pasteType: "PASTE_FORMAT",
+      pasteOrientation: "NORMAL",
+    },
+  }];
+}
+
 // ── Data operations ─────────────────────────────────────────────────────────
 
 function normalizeSortOrder(order) {
@@ -232,6 +312,27 @@ export function buildFindReplace(opts) {
 
 export function buildSetNote(range, text) {
   return [{ repeatCell: { range, cell: { note: text ?? "" }, fields: "note" } }];
+}
+
+/** Encode a JS scalar into a Sheets CellData userEnteredValue (formula if it starts with "="). */
+function encodeCellValue(v) {
+  if (v === null || v === undefined || v === "") return { userEnteredValue: { stringValue: "" } };
+  if (typeof v === "number") return { userEnteredValue: { numberValue: v } };
+  if (typeof v === "boolean") return { userEnteredValue: { boolValue: v } };
+  const s = String(v);
+  if (s.startsWith("=")) return { userEnteredValue: { formulaValue: s } };
+  return { userEnteredValue: { stringValue: s } };
+}
+
+/**
+ * Write a 2D array into a GridRange via updateCells. Unlike values.update, this
+ * binds Table structured references ([@[Col]]) in the row's table context, so
+ * such formulas don't render #ERROR!. fields defaults to "userEnteredValue" so
+ * existing cell formatting is preserved.
+ */
+export function buildUpdateCells(range, values, fields = "userEnteredValue") {
+  const rows = values.map(row => ({ values: row.map(encodeCellValue) }));
+  return [{ updateCells: { range, rows, fields } }];
 }
 
 // ── Data validation ─────────────────────────────────────────────────────────
@@ -292,12 +393,12 @@ export function conditionFromSpec(spec) {
 
 /**
  * range: GridRange. spec:
- *   { type: "clear" } | { clear: true }  → remove validation (setDataValidation w/o rule)
+ *   "clear" | { type: "clear" } | { clear: true }  → remove validation (setDataValidation w/o rule)
  *   otherwise → conditionFromSpec(spec) with { strict?, showCustomUi?, inputMessage? }
  * showCustomUi defaults true for ONE_OF_LIST / ONE_OF_RANGE / BOOLEAN.
  */
 export function buildSetValidation(range, spec) {
-  if (spec?.type === "clear" || spec?.clear === true) {
+  if (spec === "clear" || spec?.type === "clear" || spec?.clear === true) {
     return [{ setDataValidation: { range } }];
   }
   const condition = conditionFromSpec(spec);

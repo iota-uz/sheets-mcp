@@ -34,9 +34,19 @@ The \`sheets\` global is bound to the spreadsheetId you passed in:
   Structural ops (create/manage tabs):
   sheets.addSheet(title, opts?)           → { sheetId, title }
         opts: { rows?, cols?, index?, tabColor?, frozenRows?, frozenCols? }
+  sheets.ensureSheet(title, opts?)        → { sheetId, title, existed } — idempotent addSheet (re-runnable)
   sheets.deleteSheet(nameOrId)            → { ok }
   sheets.renameSheet(nameOrId, newTitle) → { ok }
   sheets.duplicateSheet(nameOrId, newTitle?) → { sheetId }
+
+  Tables (native Sheets v4 Table — typed columns, dropdowns, banding):
+  sheets.addTable(name, "Sheet!A1:I", { columns })  → { tableId, name }
+        columns: [{ name, type?, values? }]  type ∈ TEXT|DOUBLE(NUMBER)|CURRENCY|PERCENT|
+        DATE|TIME|DATE_TIME|BOOLEAN|DROPDOWN;  values:[…] ⇒ DROPDOWN + ONE_OF_LIST rule
+  sheets.ensureTable(name, "Sheet!A1:I", { columns })  → { tableId, name, existed } — idempotent
+  sheets.updateTable(nameOrId, { name?, columns?, range? })  → { ok, tableId }
+  sheets.deleteTable(nameOrId)            → { ok, tableId }
+  sheet.toTable(name, { columns?, rows? }) → wrap THIS tab's header range as a Table
 
   Raw escape hatch (full Sheets v4 power — compile your own requests):
   sheets.batchUpdate(requests)           → runs any Sheets v4 Request[] (dry-run aware)
@@ -46,6 +56,7 @@ The \`sheets\` global is bound to the spreadsheetId you passed in:
 
 Sheet API:
   sheet.describe()                            → { sheet, sheetId, headerRow, rowCount, headers: [{index, letter, text}] }
+        + table: { tableId, name, columns: [{name, type, letter}] }  when the tab has a native Table
 
   sheet.insertMany(records, opts?)            → Promise<{ inserted, skipped, rows }>
         records: Array<{ "Header": value | "=formula" }>
@@ -81,6 +92,8 @@ Sheet API:
   sheet.setFilter(range)
   sheet.findReplace(find, replace, opts?)    opts: { range?, allSheets?, matchCase?, searchByRegex?, … } (this sheet by default)
   sheet.setNote(cell, text)
+  sheet.setRowHeight(rowOrA1, px)             rowOrA1: 22 | "22" | "22:24"
+  sheet.copyFormat(srcA1, dstA1)             copy ONLY formatting ("A18:G18" → "A22:G22")
 
   sheet.setValidation(header, spec)           → set/clear a column's data validation
         spec.type ∈ ONE_OF_LIST { values } | ONE_OF_RANGE { range } | BOOLEAN {} |
@@ -88,6 +101,9 @@ Sheet API:
         DATE_BETWEEN { min, max } | DATE_AFTER/BEFORE { value } |
         TEXT_CONTAINS/EQ { value } | CUSTOM_FORMULA { formula } | "clear"
         (+ optional strict?, showCustomUi?)
+        On a native-Table typed column this auto-routes to updateTable (raw
+        setDataValidation is rejected on typed columns). Dropdown chip↔arrow
+        display is a UI-only toggle (not in the API) — Table dropdowns show chips.
 
   sheet.readRange(a1, opts?)                  → Promise<any[][]>
         Raw A1 read (e.g. "A2:B90"). opts.valueRender:
@@ -96,7 +112,14 @@ Sheet API:
         Read formatting, notes, merges, validation & hyperlinks for a range.
   sheet.writeRange(a1, values, opts?)         → Promise<{ updatedRange, updatedCells, ... }>
         Raw A1 write of a 2D array. opts.raw=true to skip USER_ENTERED parsing.
-        (Honors dryRun — captured, not committed.)
+        Cells holding a Table structured ref (=…[@[Col]]…) auto-route through
+        updateCells so they bind in the row's table context instead of #ERROR!;
+        opts.bind=true forces that path. (Honors dryRun — captured, not committed.)
+
+Volatile cells (GOOGLEFINANCE, IMPORT*, historical lookups) compute only in the
+browser — reading them via the API often returns #N/A, and a write can invalidate
+a previously-cached value. That's expected, NOT a server error; verify such values
+in the UI rather than treating #N/A as a failure.
 
 StyleObject keys:
   backgroundColor: "#hex" | "red" | {red,green,blue}

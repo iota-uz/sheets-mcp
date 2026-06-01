@@ -9,20 +9,39 @@ import assert from "node:assert/strict";
 import { exec } from "./runner.mjs";
 import { makeClient } from "./sheets-client.mjs";
 
-test("runner dry-run — addSheet is captured, not committed, returns a placeholder", async () => {
+test("runner dry-run — addSheet is captured, not committed, returns a placeholder id", async () => {
   const out = await exec(
     "FAKE_ID",
     `return await sheets.addSheet("обязательства", { tabColor: "#34a853", frozenRows: 1 });`,
     { dryRun: true },
   );
   assert.equal(out.ok, true);
-  assert.deepEqual(out.result, { sheetId: null, title: "обязательства", dryRun: true });
+  assert.equal(out.result.title, "обязательства");
+  assert.equal(out.result.dryRun, true);
+  assert.ok(out.result.sheetId < 0, "dry-run addSheet returns a negative placeholder sheetId");
 
   assert.equal(out.plannedOps.length, 1);
   assert.equal(out.plannedOps[0].kind, "batchUpdate");
   const req = out.plannedOps[0].requests[0];
   assert.equal(req.addSheet.properties.title, "обязательства");
   assert.equal(req.addSheet.properties.gridProperties.frozenRowCount, 1);
+});
+
+test("runner dry-run — a create-then-populate chain plans using the placeholder id (issue #10 #8)", async () => {
+  const out = await exec(
+    "FAKE_ID",
+    `const s = await sheets.addSheet("New");
+     return await sheets.batchUpdate([{ updateCells: {
+       start: { sheetId: s.sheetId, rowIndex: 0, columnIndex: 0 },
+       rows: [{ values: [{ userEnteredValue: { stringValue: "x" } }] }],
+       fields: "userEnteredValue",
+     } }]);`,
+    { dryRun: true },
+  );
+  assert.equal(out.ok, true);
+  assert.equal(out.plannedOps.length, 2);
+  const dependent = out.plannedOps[1].requests[0].updateCells.start.sheetId;
+  assert.ok(dependent < 0, "the follow-up op references the minted placeholder sheetId");
 });
 
 test("runner dry-run — raw escape hatch batchUpdate is captured, not committed", async () => {

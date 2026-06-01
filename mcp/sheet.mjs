@@ -35,6 +35,13 @@ import {
   buildFindReplace,
   buildSetNote,
   buildSetValidation,
+  buildSetRowHeight,
+  buildCopyFormat,
+  buildUpdateCells,
+  buildAddTable,
+  buildUpdateTable,
+  buildColumnValidationRule,
+  compileTableColumns,
 } from "./requests.mjs";
 
 /**
@@ -80,6 +87,7 @@ class Sheet {
     this.headerToIdx = new Map();
     this._ambiguous = new Map();
     this._validations = new Map();
+    this.table = null; // { tableId, name, baseColumn, endColumn, columnProperties } when the tab has a Table
     this._nextRowCache = null;
     this._idempotencyMap = null;
     this._deleted = false;
@@ -104,6 +112,7 @@ class Sheet {
       "spreadsheetId," +
       "sheets(" +
         "properties(sheetId,title,gridProperties)," +
+        "tables(tableId,name,range,columnProperties(columnIndex,columnName,columnType))," +
         "data(startRow,startColumn,rowData(values(formattedValue,dataValidation)))" +
       ")";
 
@@ -154,10 +163,48 @@ class Sheet {
         strict: dv.strict ?? false,
       });
     }
+
+    this._loadTable(sheetMeta.tables || []);
+  }
+
+  /**
+   * Record the Table covering this handle's header row (if any). Stores absolute
+   * column span + per-column types so describe() can report them and
+   * setValidation can route typed columns through updateTable.
+   */
+  _loadTable(tables) {
+    this.table = null;
+    if (!tables.length) return;
+    const headerIdx0 = this.headerRow - 1;
+    const t = tables.find(tb => {
+      const r = tb.range || {};
+      const sr = r.startRowIndex ?? 0;
+      const er = r.endRowIndex ?? Infinity;
+      return headerIdx0 >= sr && headerIdx0 < er;
+    }) || tables[0];
+
+    const r = t.range || {};
+    const baseColumn = r.startColumnIndex ?? 0;
+    const columnProperties = (t.columnProperties || []).map(cp => ({ ...cp }));
+    const width = r.endColumnIndex != null ? r.endColumnIndex - baseColumn : columnProperties.length;
+    this.table = {
+      tableId: t.tableId,
+      name: t.name,
+      baseColumn,
+      endColumn: baseColumn + width,
+      columnProperties,
+    };
+  }
+
+  /** Absolute column index → its table columnProperties entry, or null. */
+  _tableColumn(idx) {
+    if (!this.table || idx < this.table.baseColumn || idx >= this.table.endColumn) return null;
+    const rel = idx - this.table.baseColumn;
+    return this.table.columnProperties.find(cp => (cp.columnIndex ?? 0) === rel) ?? null;
   }
 
   describe() {
-    return {
+    const out = {
       sheet: this.name,
       sheetId: this.sheetId,
       headerRow: this.headerRow,
@@ -166,6 +213,18 @@ class Sheet {
         .map((text, index) => ({ index, letter: colLetter(index), text }))
         .filter(h => h.text !== ""),
     };
+    if (this.table) {
+      out.table = {
+        tableId: this.table.tableId,
+        name: this.table.name,
+        columns: this.table.columnProperties.map(cp => ({
+          name: cp.columnName,
+          type: cp.columnType ?? null,
+          letter: colLetter(this.table.baseColumn + (cp.columnIndex ?? 0)),
+        })),
+      };
+    }
+    return out;
   }
 
   _col(header) {
@@ -683,6 +742,27 @@ class Sheet {
    */
   async setValidation(header, spec) {
     const idx = this._col(header);
+    const isClear = spec === "clear" || spec?.type === "clear" || spec?.clear === true;
+
+    // A column inside a native Table is a typed column — raw setDataValidation is
+    // rejected ("not allowed on cells in typed columns"). Route to updateTable so
+    // the rule lives on the column definition instead (issue #10 #5).
+    if (this._tableColumn(idx) || (this.table && idx >= this.table.baseColumn && idx < this.table.endColumn)) {
+      const cols = this.table.columnProperties.map(cp => ({ ...cp }));
+      const rel = idx - this.table.baseColumn;
+      let target = cols.find(cp => (cp.columnIndex ?? 0) === rel);
+      if (!target) { target = { columnIndex: rel, columnName: this.headers[idx] || "" }; cols.push(target); }
+      if (isClear) delete target.dataValidationRule;
+      else target.dataValidationRule = buildColumnValidationRule(spec);
+      await this.client.batchUpdate(
+        this.spreadsheetId,
+        buildUpdateTable({ tableId: this.table.tableId, columnProperties: cols }, "columnProperties"),
+      );
+      this.table.columnProperties = cols;
+      this._syncValidationCache(header, spec, isClear);
+      return { ok: true, table: true };
+    }
+
     const range = {
       sheetId: this.sheetId,
       startRowIndex: this.headerRow,
@@ -690,13 +770,17 @@ class Sheet {
       endColumnIndex: idx + 1,
     };
     await this.client.batchUpdate(this.spreadsheetId, buildSetValidation(range, spec));
+    this._syncValidationCache(header, spec, isClear);
+    return { ok: true };
+  }
 
-    // Keep the in-memory validation cache (consulted by insert/update) in sync.
-    // Only ONE_OF_LIST is enforced locally; other types and clears just evict.
+  // Keep the in-memory validation cache (consulted by insert/update) in sync.
+  // Only ONE_OF_LIST is enforced locally; other types and clears just evict.
+  _syncValidationCache(header, spec, isClear) {
     const k = normHeader(header);
-    if (spec?.type === "clear" || spec?.clear === true) {
+    if (isClear) {
       this._validations.delete(k);
-    } else if (spec.type === "ONE_OF_LIST") {
+    } else if (spec?.type === "ONE_OF_LIST") {
       this._validations.set(k, {
         type: "ONE_OF_LIST",
         values: spec.values.map(v => String(v)),
@@ -705,7 +789,6 @@ class Sheet {
     } else {
       this._validations.delete(k);
     }
-    return { ok: true };
   }
 
   /**
@@ -727,9 +810,30 @@ class Sheet {
     return this.client.valuesGet(this.spreadsheetId, range, { valueRenderOption: valueRender });
   }
 
-  async writeRange(a1, values, { raw = false } = {}) {
+  /**
+   * Write a 2D array at an A1 anchor. By default uses values.update (USER_ENTERED).
+   * Cells holding a Table structured reference (=…[@[Col]]… / =…[[Col]…]) are
+   * routed through updateCells so they bind in the row's table context instead of
+   * rendering #ERROR! (issue #10 #2). Pass { bind: true } to force that path,
+   * { raw: true } to store values verbatim (skips both parsing and binding).
+   */
+  async writeRange(a1, values, { raw = false, bind = false } = {}) {
     if (!Array.isArray(values) || !Array.isArray(values[0])) {
       throw new Error("writeRange: values must be a 2D array");
+    }
+    const hasStructuredRef = values.some(
+      row => Array.isArray(row) && row.some(v => typeof v === "string" && /^=.*\[(@|\[)/.test(v)),
+    );
+    if (!raw && (bind || hasStructuredRef)) {
+      const grid = a1ToGridRange(this.sheetId, a1);
+      await this.client.batchUpdate(this.spreadsheetId, buildUpdateCells(grid, values));
+      return {
+        updatedRange: `${quoteSheetName(this.name)}!${a1}`,
+        updatedRows: values.length,
+        updatedColumns: Math.max(...values.map(r => (Array.isArray(r) ? r.length : 0))),
+        updatedCells: values.reduce((s, r) => s + (Array.isArray(r) ? r.length : 0), 0),
+        bound: true,
+      };
     }
     const range = `${quoteSheetName(this.name)}!${a1}`;
     const res = await this.client.valuesUpdate(this.spreadsheetId, range, values, { raw });
@@ -739,6 +843,46 @@ class Sheet {
       updatedColumns: res.updatedColumns ?? 0,
       updatedCells: res.updatedCells ?? 0,
     };
+  }
+
+  /** Set row height. rowOrA1: 22 | "22" | "22:24" (1-based). */
+  async setRowHeight(rowOrA1, height) {
+    const a1 = typeof rowOrA1 === "number" ? String(rowOrA1) : rowOrA1;
+    const grid = a1ToGridRange(this.sheetId, a1);
+    if (grid.startRowIndex == null) throw new Error(`setRowHeight: "${rowOrA1}" must specify rows`);
+    const endRow = grid.endRowIndex ?? grid.startRowIndex + 1;
+    await this.client.batchUpdate(this.spreadsheetId, buildSetRowHeight(this.sheetId, grid.startRowIndex, endRow, height));
+    return { ok: true, range: a1, height };
+  }
+
+  /** Copy ONLY formatting from one range onto another ("A18:G18" → "A22:G22"). */
+  async copyFormat(srcA1, dstA1) {
+    await this.client.batchUpdate(
+      this.spreadsheetId,
+      buildCopyFormat(a1ToGridRange(this.sheetId, srcA1), a1ToGridRange(this.sheetId, dstA1)),
+    );
+    return { ok: true, source: srcA1, destination: dstA1 };
+  }
+
+  /**
+   * Convert this tab's header range into a native Table. opts:
+   *   { columns?: [{name,type?,values?}], rows?: number }
+   * Without columns, infers one TEXT-ish column per non-empty header.
+   */
+  async toTable(name, opts = {}) {
+    const colsSpec = opts.columns ?? this.headers.filter(Boolean).map(h => ({ name: h }));
+    const columnProperties = compileTableColumns(colsSpec);
+    const range = {
+      sheetId: this.sheetId,
+      startRowIndex: this.headerRow - 1,
+      startColumnIndex: 0,
+      endColumnIndex: columnProperties.length,
+    };
+    if (opts.rows != null) range.endRowIndex = this.headerRow - 1 + opts.rows;
+    const res = await this.client.batchUpdate(this.spreadsheetId, buildAddTable({ name, range, columnProperties }));
+    const props = res?.replies?.[0]?.addTable?.table;
+    await this._init();
+    return props?.tableId != null ? { tableId: props.tableId, name: props.name } : { tableId: null, name, dryRun: true };
   }
 }
 

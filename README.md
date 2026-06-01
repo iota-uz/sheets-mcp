@@ -83,9 +83,19 @@ sheets.spreadsheetId(): string
 // Structural ops — create / manage tabs (no human in the browser needed)
 sheets.addSheet(title, opts?): Promise<{ sheetId, title }>
    opts: { rows?, cols?, index?, tabColor?, frozenRows?, frozenCols? }
+sheets.ensureSheet(title, opts?): Promise<{ sheetId, title, existed }>   // idempotent — re-runnable
 sheets.deleteSheet(nameOrId): Promise<{ ok }>
 sheets.renameSheet(nameOrId, newTitle): Promise<{ ok }>
 sheets.duplicateSheet(nameOrId, newTitle?): Promise<{ sheetId }>
+
+// Native Tables — typed columns, dropdowns, banding
+sheets.addTable(name, "Sheet!A1:I", { columns }): Promise<{ tableId, name }>
+   columns: [{ name, type?, values? }]
+   type ∈ TEXT | DOUBLE(NUMBER) | CURRENCY | PERCENT | DATE | TIME | DATE_TIME | BOOLEAN | DROPDOWN
+   values: […] ⇒ DROPDOWN column + ONE_OF_LIST rule
+sheets.ensureTable(name, "Sheet!A1:I", { columns }): Promise<{ tableId, name, existed }>  // idempotent
+sheets.updateTable(nameOrId, { name?, columns?, range? }): Promise<{ ok, tableId }>
+sheets.deleteTable(nameOrId): Promise<{ ok, tableId }>
 
 // Raw escape hatch — full Sheets v4 power for anything not covered by the sugar
 sheets.batchUpdate(requests): Promise<...>          // any Request[], dry-run aware
@@ -97,7 +107,9 @@ sheets.developerMetadataSearch(filters): Promise<...>
 The `Sheet`:
 
 ```ts
-sheet.describe(): { sheet, sheetId, headerRow, rowCount, headers }
+sheet.describe(): { sheet, sheetId, headerRow, rowCount, headers, table? }
+   table (when the tab has a native Table): { tableId, name, columns: [{ name, type, letter }] }
+sheet.toTable(name, { columns?, rows? }): Promise<{ tableId, name }>   // wrap this tab as a Table
 
 sheet.insertMany(records, opts?): Promise<{ inserted, skipped, rows }>
    records: Array<{ "Header text": value | "=formula" }>
@@ -126,6 +138,8 @@ sheet.sort(range, [{ column, order?: "ASC"|"DESC" }])
 sheet.setFilter(range)
 sheet.findReplace(find, replace, opts?)             // this sheet by default; opts.range / opts.allSheets
 sheet.setNote(cell, text)
+sheet.setRowHeight(rowOrA1, px)                     // 22 | "22" | "22:24"
+sheet.copyFormat(srcA1, dstA1)                      // copy ONLY formatting: "A18:G18" → "A22:G22"
 
 sheet.setValidation(header, spec): Promise<{ ok }>
    spec.type ∈ ONE_OF_LIST { values } | ONE_OF_RANGE { range } | BOOLEAN {} |
@@ -133,10 +147,14 @@ sheet.setValidation(header, spec): Promise<{ ok }>
    DATE_BETWEEN { min, max } | DATE_AFTER/BEFORE { value } |
    TEXT_CONTAINS/EQ { value } | CUSTOM_FORMULA { formula } | "clear"
    (+ optional strict?, showCustomUi?)
+   On a native-Table typed column, auto-routes to updateTable (raw setDataValidation
+   is rejected on typed columns).
 
 sheet.readRange(a1, { valueRender? }): Promise<any[][]>
 sheet.readFormatting(a1, opts?): Promise<{ data, merges }>   // formatting, notes, merges, validation
-sheet.writeRange(a1, values2d, { raw? }): Promise<{ updatedRange, updatedCells, ... }>
+sheet.writeRange(a1, values2d, { raw?, bind? }): Promise<{ updatedRange, updatedCells, ... }>
+   // Table structured refs (=…[@[Col]]…) auto-route through updateCells so they
+   // bind in row context instead of #ERROR!; bind:true forces it, raw:true skips.
 ```
 
 Pass `rows: [123, 456]` to `update/delete/format` to skip the `find()` lookup when row numbers are already known. Every mutating method compiles to `batchUpdate` (or a guarded value write) and therefore respects `dryRun`.
@@ -247,9 +265,12 @@ Each `sheets_exec` call runs against its own client and handle registry, so:
 - **Idempotency survives a rename.** Tokens are scoped to a row by `sheetId`, not by tab title.
 - **Ambiguous headers fail loud.** If two columns share a header (after case/`ё`→`е` normalization), a write keyed by it throws `Ambiguous header "<h>" — appears in columns B, E` rather than guessing. `describe()` still lists every column so you can spot the dup.
 
-### Known limitation
+### Known limitations
 
-- **Dry-run can't read a tab you changed earlier in the same script.** Under `dryRun: true`, structural ops (`addSheet`/`renameSheet`/`deleteSheet`) are *captured*, not executed, but reads (`find`, `readRange`, `_getNextRow`) hit the real spreadsheet. So renaming a tab then reading it in the same dry-run script fails — the tab isn't really renamed yet. Run such flows for real (or split the preview).
+- **Dry-run can plan writes against a tab/table you created earlier in the same script, but can't *read* it.** Under `dryRun: true`, structural ops (`addSheet`/`duplicateSheet`/`addTable`) are *captured*, not executed, and now return a synthetic **placeholder id** (negative `sheetId`, `dryrun:` `tableId`) so a follow-up `writeRange`/`batchUpdate` referencing it still gets planned. But reads (`find`, `readRange`, `describe`) hit the real spreadsheet, so reading a not-yet-real tab/table — or one you renamed/deleted earlier in the same dry-run — fails. Run such flows for real (or split the preview).
+- **GoogleFinance / volatile cells read as `#N/A`.** `GOOGLEFINANCE`, `IMPORT*`, and historical lookups compute only in the browser; the API returns `#N/A` for them, and a nearby write can invalidate a previously-cached value. This is Google's behavior, not a server error — don't treat `#N/A` from these as a failure; verify in the UI.
+- **Table structured references must bind in row context.** A formula like `=IF([@[Сумма]]=…)` written through the plain values path renders `#ERROR!`. `writeRange` detects structured refs and auto-routes them through `updateCells` (which binds correctly); `opts.raw: true` skips that and stores the formula verbatim.
+- **Table dropdown chip ↔ arrow display is UI-only.** The chip vs. arrow toggle isn't in the Sheets API — native Table dropdown columns always render as chips. An arrow-style dropdown needs a non-Table range plus a manual UI toggle.
 
 ## Release (maintainers)
 

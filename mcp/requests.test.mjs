@@ -8,6 +8,8 @@ import {
   buildInsertColumns, buildDeleteColumns, buildSort, buildSetFilter,
   buildFindReplace, buildSetNote, buildSetValidation, conditionFromSpec,
   buildDeveloperMetadata, META_KEY_IDEMPOTENCY,
+  compileTableColumns, buildAddTable, buildUpdateTable, buildDeleteTable,
+  buildSetRowHeight, buildCopyFormat, buildUpdateCells,
 } from "./requests.mjs";
 
 const RANGE = { sheetId: 1, startRowIndex: 1, endRowIndex: 10, startColumnIndex: 1, endColumnIndex: 4 };
@@ -181,9 +183,64 @@ test("buildSetValidation — rule shape, defaults, clear", () => {
   assert.equal(buildSetValidation(RANGE, { type: "BOOLEAN" })[0]
     .setDataValidation.rule.showCustomUi, true);
 
-  // clear → no rule
+  // clear → no rule (all three forms, incl. the bare "clear" string — issue #10 bug #1)
   assert.deepEqual(buildSetValidation(RANGE, { clear: true }), [{ setDataValidation: { range: RANGE } }]);
   assert.deepEqual(buildSetValidation(RANGE, { type: "clear" }), [{ setDataValidation: { range: RANGE } }]);
+  assert.deepEqual(buildSetValidation(RANGE, "clear"), [{ setDataValidation: { range: RANGE } }]);
+});
+
+// ── Tables ───────────────────────────────────────────────────────────────────
+
+test("compileTableColumns — types, aliases, dropdown values → validation", () => {
+  const cols = compileTableColumns([
+    { name: "Контрагент", type: "TEXT" },
+    { name: "Категория", type: "DROPDOWN", values: ["Налоги", "Резерв"] },
+    { name: "Сумма", type: "NUMBER" },            // NUMBER → DOUBLE alias
+    { name: "Дата", type: "date" },               // lowercased passthrough
+    { name: "Авто", values: ["a", "b"] },         // values w/o type → DROPDOWN implied
+  ]);
+  assert.deepEqual(cols[0], { columnIndex: 0, columnName: "Контрагент", columnType: "TEXT" });
+  assert.deepEqual(cols[1], {
+    columnIndex: 1, columnName: "Категория", columnType: "DROPDOWN",
+    dataValidationRule: { condition: { type: "ONE_OF_LIST", values: [{ userEnteredValue: "Налоги" }, { userEnteredValue: "Резерв" }] }, strict: false },
+  });
+  assert.equal(cols[2].columnType, "DOUBLE");
+  assert.equal(cols[3].columnType, "DATE");
+  assert.equal(cols[4].columnType, "DROPDOWN");
+  assert.ok(cols[4].dataValidationRule);
+});
+
+test("buildAddTable / buildUpdateTable / buildDeleteTable", () => {
+  const table = { name: "T", range: RANGE, columnProperties: [{ columnIndex: 0, columnName: "A", columnType: "TEXT" }] };
+  assert.deepEqual(buildAddTable(table), [{ addTable: { table } }]);
+  assert.deepEqual(buildUpdateTable({ tableId: "t1", name: "T2" }, "name"),
+    [{ updateTable: { table: { tableId: "t1", name: "T2" }, fields: "name" } }]);
+  assert.deepEqual(buildDeleteTable("t1"), [{ deleteTable: { tableId: "t1" } }]);
+});
+
+// ── Row height / copy format / updateCells ───────────────────────────────────
+
+test("buildSetRowHeight", () => {
+  assert.deepEqual(buildSetRowHeight(7, 21, 22, 39),
+    [{ updateDimensionProperties: { range: { sheetId: 7, dimension: "ROWS", startIndex: 21, endIndex: 22 }, properties: { pixelSize: 39 }, fields: "pixelSize" } }]);
+});
+
+test("buildCopyFormat — PASTE_FORMAT only", () => {
+  const src = { sheetId: 7, startRowIndex: 17, endRowIndex: 18 };
+  const dst = { sheetId: 7, startRowIndex: 21, endRowIndex: 22 };
+  assert.deepEqual(buildCopyFormat(src, dst),
+    [{ copyPaste: { source: src, destination: dst, pasteType: "PASTE_FORMAT", pasteOrientation: "NORMAL" } }]);
+});
+
+test("buildUpdateCells — formulas → formulaValue, fields default userEnteredValue", () => {
+  const [req] = buildUpdateCells(RANGE, [['=IF([@[Сумма]]="";"";1)', 42, "txt"]]);
+  assert.equal(req.updateCells.fields, "userEnteredValue");
+  assert.deepEqual(req.updateCells.range, RANGE);
+  assert.deepEqual(req.updateCells.rows[0].values, [
+    { userEnteredValue: { formulaValue: '=IF([@[Сумма]]="";"";1)' } },
+    { userEnteredValue: { numberValue: 42 } },
+    { userEnteredValue: { stringValue: "txt" } },
+  ]);
 });
 
 test("buildAddConditionalFormat — boolean rule with format", () => {

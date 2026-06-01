@@ -13,12 +13,35 @@
  */
 
 import { createSheet, normHeader } from "./sheet.mjs";
+import { a1ToGridRange } from "./a1.mjs";
 import {
   buildAddSheet,
   buildDeleteSheet,
   buildRenameSheet,
   buildDuplicateSheet,
+  buildAddTable,
+  buildUpdateTable,
+  buildDeleteTable,
+  compileTableColumns,
 } from "./requests.mjs";
+
+/** Leading sheet name of an A1 range ("Sheet!A1:I" → "Sheet", "'A b'!A1" → "A b"), else null. */
+function sheetPrefixOf(a1) {
+  if (typeof a1 !== "string") return null;
+  if (a1[0] === "'") {
+    let i = 1, name = "";
+    while (i < a1.length) {
+      if (a1[i] === "'") {
+        if (a1[i + 1] === "'") { name += "'"; i += 2; continue; }
+        break;
+      }
+      name += a1[i]; i++;
+    }
+    return (a1[i] === "'" && a1[i + 1] === "!") ? name : null;
+  }
+  const bang = a1.indexOf("!");
+  return bang >= 0 ? a1.slice(0, bang) : null;
+}
 
 export function makeSheetsApi(spreadsheetId, client) {
   // Per-exec handle registry. Key: `${normHeader(name)}|${headerRow}`.
@@ -67,6 +90,51 @@ export function makeSheetsApi(spreadsheetId, client) {
     return matches[0].properties.sheetId;
   }
 
+  // Resolve an A1 range carrying a sheet prefix ("Sheet!A1:I") → GridRange.
+  async function resolveRangeToGrid(rangeA1) {
+    const name = sheetPrefixOf(rangeA1);
+    if (name == null) {
+      throw new Error(`range "${rangeA1}" must include a sheet name, e.g. "Sheet!A1:I"`);
+    }
+    const sheetId = await resolveSheetId(name);
+    return a1ToGridRange(sheetId, rangeA1); // a1ToGridRange strips the prefix itself
+  }
+
+  // Resolve a table name OR tableId string → tableId. Scans every sheet's tables.
+  async function resolveTableId(nameOrId) {
+    const meta = await client.getSpreadsheet(spreadsheetId);
+    const tables = (meta.sheets || []).flatMap(s => s.tables || []);
+    const byName = tables.find(t => t.name === nameOrId);
+    if (byName) return byName.tableId;
+    const byId = tables.find(t => t.tableId === nameOrId);
+    if (byId) return byId.tableId;
+    const known = tables.map(t => t.name).filter(Boolean).join(", ");
+    throw new Error(`Table "${nameOrId}" not found. Known: ${known}`);
+  }
+
+  // Negative sheetIds/"dryrun:" tableIds minted by the dry-run capture signal a
+  // not-yet-real object — surface that as dryRun on the structural-op result.
+  async function addSheet(title, opts = {}) {
+    const res = await client.batchUpdate(spreadsheetId, buildAddSheet({ title, ...opts }));
+    const props = res?.replies?.[0]?.addSheet?.properties;
+    if (!props || props.sheetId == null) return { sheetId: null, title, dryRun: true };
+    const out = { sheetId: props.sheetId, title: props.title, index: props.index };
+    if (props.sheetId < 0) out.dryRun = true;
+    return out;
+  }
+
+  async function addTable(tableName, rangeA1, opts = {}) {
+    const range = await resolveRangeToGrid(rangeA1);
+    const table = { name: tableName, range, columnProperties: compileTableColumns(opts.columns ?? []) };
+    if (opts.tableId != null) table.tableId = opts.tableId;
+    const res = await client.batchUpdate(spreadsheetId, buildAddTable(table));
+    const t = res?.replies?.[0]?.addTable?.table;
+    if (!t || t.tableId == null) return { tableId: null, name: tableName, dryRun: true };
+    const out = { tableId: t.tableId, name: t.name };
+    if (typeof t.tableId === "string" && t.tableId.startsWith("dryrun:")) out.dryRun = true;
+    return out;
+  }
+
   return {
     // ── per-sheet handles ──
     sheet: getSheet,
@@ -84,11 +152,17 @@ export function makeSheetsApi(spreadsheetId, client) {
     developerMetadataSearch: (filters) => client.developerMetadataSearch(spreadsheetId, filters),
 
     // ── structural ops ──
-    async addSheet(title, opts = {}) {
-      const res = await client.batchUpdate(spreadsheetId, buildAddSheet({ title, ...opts }));
-      const props = res?.replies?.[0]?.addSheet?.properties;
-      if (!props || props.sheetId == null) return { sheetId: null, title, dryRun: true };
-      return { sheetId: props.sheetId, title: props.title, index: props.index };
+    addSheet,
+
+    /** Create the tab only if a tab with this title doesn't already exist. */
+    async ensureSheet(title, opts = {}) {
+      const meta = await client.getSpreadsheet(spreadsheetId);
+      const target = normHeader(title);
+      const found = (meta.sheets || []).find(s => normHeader(s.properties?.title) === target);
+      if (found) {
+        return { sheetId: found.properties.sheetId, title: found.properties.title, existed: true };
+      }
+      return { ...(await addSheet(title, opts)), existed: false };
     },
 
     async deleteSheet(nameOrId) {
@@ -123,7 +197,39 @@ export function makeSheetsApi(spreadsheetId, client) {
       );
       const props = res?.replies?.[0]?.duplicateSheet?.properties;
       if (!props || props.sheetId == null) return { sheetId: null, title: newTitle ?? null, dryRun: true };
-      return { sheetId: props.sheetId, title: props.title };
+      const out = { sheetId: props.sheetId, title: props.title };
+      if (props.sheetId < 0) out.dryRun = true;
+      return out;
+    },
+
+    // ── tables (native Sheets v4 Table) ──
+    addTable,
+
+    /** Create the table only if one with this name doesn't already exist. */
+    async ensureTable(name, rangeA1, opts = {}) {
+      const meta = await client.getSpreadsheet(spreadsheetId);
+      const tables = (meta.sheets || []).flatMap(s => s.tables || []);
+      const found = tables.find(t => t.name === name);
+      if (found) return { tableId: found.tableId, name: found.name, existed: true };
+      return { ...(await addTable(name, rangeA1, opts)), existed: false };
+    },
+
+    async updateTable(nameOrId, opts = {}) {
+      const tableId = await resolveTableId(nameOrId);
+      const table = { tableId };
+      const fields = [];
+      if (opts.name != null) { table.name = opts.name; fields.push("name"); }
+      if (opts.columns != null) { table.columnProperties = compileTableColumns(opts.columns); fields.push("columnProperties"); }
+      if (opts.range != null) { table.range = await resolveRangeToGrid(opts.range); fields.push("range"); }
+      if (fields.length === 0) throw new Error("updateTable: provide name, columns, and/or range");
+      await client.batchUpdate(spreadsheetId, buildUpdateTable(table, fields.join(",")));
+      return { ok: true, tableId };
+    },
+
+    async deleteTable(nameOrId) {
+      const tableId = await resolveTableId(nameOrId);
+      await client.batchUpdate(spreadsheetId, buildDeleteTable(tableId));
+      return { ok: true, tableId };
     },
   };
 }
