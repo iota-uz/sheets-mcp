@@ -1,6 +1,6 @@
 {
   "name": "@iota-uz/sheets-mcp",
-  "version": "0.1.1",
+  "version": "0.2.0",
   "description": "Generic Model Context Protocol server for Google Sheets — typed sheet-agnostic API with atomic batch writes and idempotency.",
   "type": "module",
   "main": "mcp/server.mjs",
