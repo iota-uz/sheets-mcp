@@ -8,6 +8,7 @@
 
 import { google } from "googleapis";
 import { loadAuth } from "./auth.mjs";
+import { colLetter } from "./a1.mjs";
 
 let cachedSheets = null;
 
@@ -60,14 +61,67 @@ async function batchUpdate(spreadsheetId, requests, { responseIncludeGridData = 
     throw new Error("batchUpdate requires a non-empty requests array");
   }
   const sheets = getSheets();
-  const res = await sheets.spreadsheets.batchUpdate({
-    spreadsheetId,
-    requestBody: {
-      requests,
-      responseIncludeGridData,
-    },
-  });
-  return res.data;
+  try {
+    const res = await sheets.spreadsheets.batchUpdate({
+      spreadsheetId,
+      requestBody: {
+        requests,
+        responseIncludeGridData,
+      },
+    });
+    return res.data;
+  } catch (e) {
+    // Google reports only "requests[N].<op>: <msg>" — map it back to the op +
+    // its A1 range so the failure is localizable (issue #12 I4).
+    throw enrichBatchError(e, requests);
+  }
+}
+
+/**
+ * Map a Google batchUpdate error back to the offending request. Parses the
+ * `requests[N]` index, names the op kind, and derives an A1 range from the op's
+ * GridRange (no sheet title at this layer → column/row letters only, plus the
+ * raw sheetId in `.range`). Returns a NEW Error with the enriched message and
+ * { requestIndex, opKind, range, cause }; if the message has no parseable index
+ * the original error is returned unchanged. Pure; exported for tests.
+ */
+export function enrichBatchError(err, requests) {
+  const msg = err?.message ?? String(err);
+  const m = /requests\[(\d+)\]/.exec(msg);
+  if (!m) return err;
+  const idx = Number(m[1]);
+  const req = Array.isArray(requests) ? requests[idx] : undefined;
+  const opKind = req && typeof req === "object" ? Object.keys(req)[0] ?? null : null;
+  const grid = opKind ? findGridRange(req[opKind]) : null;
+  const a1 = grid ? gridToLettersA1(grid) : null;
+  const where = a1 ? ` (range ${a1})` : grid ? ` (range ${JSON.stringify(grid)})` : "";
+
+  const e = new Error(`batchUpdate failed at requests[${idx}]${opKind ? ` ${opKind}` : ""}${where}: ${msg}`);
+  e.requestIndex = idx;
+  if (opKind) e.opKind = opKind;
+  if (grid) { e.range = a1 ?? grid; if (grid.sheetId != null) e.sheetId = grid.sheetId; }
+  e.cause = err;
+  return e;
+}
+
+function findGridRange(body) {
+  if (!body || typeof body !== "object") return null;
+  if (body.range && typeof body.range === "object") return body.range;
+  if (body.start && typeof body.start === "object") return body.start; // updateCells
+  return null;
+}
+
+/** GridRange → prefix-less A1 letters ("B2:D10"), tolerating partial bounds. */
+function gridToLettersA1(g) {
+  const { startRowIndex, endRowIndex, startColumnIndex, endColumnIndex, rowIndex, columnIndex } = g;
+  const sc = startColumnIndex ?? columnIndex;
+  const sr = startRowIndex ?? rowIndex;
+  if (sc == null && sr == null) return null;
+  const start = `${sc == null ? "" : colLetter(sc)}${sr == null ? "" : sr + 1}`;
+  const endCol = endColumnIndex == null ? "" : colLetter(endColumnIndex - 1);
+  const endRow = endRowIndex == null ? "" : String(endRowIndex);
+  const end = `${endCol}${endRow}`;
+  return end ? `${start}:${end}` : start;
 }
 
 /**
@@ -85,7 +139,9 @@ async function valuesGet(spreadsheetId, range, { valueRenderOption = "UNFORMATTE
 }
 
 /**
- * Read multiple ranges in one round trip.
+ * Read multiple ranges in one round trip. Returns a bare array of valueRanges
+ * (NOT Google's `{ valueRanges }` wrapper), one per input range and in order.
+ * Every entry is normalized to carry a `values` array (see normalizeValueRanges).
  */
 async function valuesBatchGet(spreadsheetId, ranges, { valueRenderOption = "UNFORMATTED_VALUE" } = {}) {
   const sheets = getSheets();
@@ -94,7 +150,17 @@ async function valuesBatchGet(spreadsheetId, ranges, { valueRenderOption = "UNFO
     ranges,
     valueRenderOption,
   });
-  return res.data.valueRanges || [];
+  return normalizeValueRanges(res.data.valueRanges);
+}
+
+/**
+ * Normalize Google's valueRanges so every entry carries a `values` array. The
+ * API OMITS `values` for an empty range, which makes the common
+ * `result[i].values[0]` throw (issue #12 B5). Pure; exported for tests.
+ */
+export function normalizeValueRanges(valueRanges) {
+  if (!Array.isArray(valueRanges)) return [];
+  return valueRanges.map(vr => ({ ...vr, values: vr?.values ?? [] }));
 }
 
 /**

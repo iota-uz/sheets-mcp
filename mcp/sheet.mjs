@@ -17,7 +17,7 @@
  */
 
 import { compileStyle } from "./schema.mjs";
-import { colLetter, colToIdx, a1ToGridRange } from "./a1.mjs";
+import { colLetter, colToIdx, a1ToGridRange, gridRangesOverlap } from "./a1.mjs";
 import {
   META_KEY_IDEMPOTENCY,
   buildDeveloperMetadata,
@@ -75,11 +75,14 @@ function guardDeleted(sheet) {
 }
 
 class Sheet {
-  constructor(spreadsheetId, name, { headerRow = 1 } = {}, client) {
+  constructor(spreadsheetId, name, { headerRow = 1, computedColumns = [] } = {}, client) {
     this.spreadsheetId = spreadsheetId;
     this.name = name;
     this.headerRow = headerRow;
     this.client = client;
+    // Columns never written on insert (e.g. an ARRAYFORMULA spills the column
+    // from row 2 — writing it produces #REF!). issue #12 I5.
+    this._computedColumns = new Set((computedColumns || []).map(normHeader));
     this.sheetId = null;
     this.rowCount = 0;
     this.colCount = 0;
@@ -291,8 +294,20 @@ class Sheet {
     return map;
   }
 
-  _validateRecord(record, errors) {
+  /** Effective set of columns (normalized) to skip on a write: the sheet's
+   *  computed columns plus any per-call opts.skipColumns. */
+  _effectiveSkip(opts = {}) {
+    if (!Array.isArray(opts.skipColumns) || opts.skipColumns.length === 0) {
+      return this._computedColumns;
+    }
+    const set = new Set(this._computedColumns);
+    for (const c of opts.skipColumns) set.add(normHeader(c));
+    return set;
+  }
+
+  _validateRecord(record, errors, skip) {
     for (const [header, value] of Object.entries(record)) {
+      if (skip && skip.has(normHeader(header))) continue; // computed/read-only: not written, not validated
       this._col(header);
       if (typeof value === "string" && value.startsWith("=")) continue;
 
@@ -309,14 +324,16 @@ class Sheet {
   async insertMany(records, opts = {}) {
     if (!Array.isArray(records)) throw new Error("insertMany expects an array");
     if (records.length === 0) {
-      return { inserted: [], skipped: [], rows: [] };
+      return { inserted: [], skipped: [], rows: [], skippedColumns: [] };
     }
+
+    const skip = this._effectiveSkip(opts);
 
     const errors = [];
     for (let i = 0; i < records.length; i++) {
       const rec = records[i];
       const before = errors.length;
-      this._validateRecord(rec, errors);
+      this._validateRecord(rec, errors, skip);
       if (errors.length > before) errors[errors.length - 1] = `record[${i}]: ${errors[errors.length - 1]}`;
     }
     if (errors.length > 0) {
@@ -351,13 +368,21 @@ class Sheet {
     }
 
     if (toInsert.length === 0) {
-      return { inserted: [], skipped, rows: [] };
+      return { inserted: [], skipped, rows: [], skippedColumns: [] };
+    }
+
+    // Report which columns were dropped from at least one record (computed/skip).
+    const skippedColsSet = new Set();
+    for (const { record } of toInsert) {
+      for (const header of Object.keys(record)) {
+        if (skip.has(normHeader(header))) skippedColsSet.add(header);
+      }
     }
 
     const startRow = await this._getNextRow();
     const rowFormat = opts.format;
 
-    const requests = this._buildBatchInsertRequests({ startRow, toInsert, rowFormat });
+    const requests = this._buildBatchInsertRequests({ startRow, toInsert, rowFormat, skip });
 
     // Routes through the client: under dry-run the requests are captured and a
     // synthetic reply returned, so the bookkeeping below runs either way and two
@@ -375,12 +400,14 @@ class Sheet {
       inserted: toInsert.map((t, i) => ({ index: t.index, row: startRow + i, key: t.key })),
       skipped,
       rows: toInsert.map((_, i) => startRow + i),
+      skippedColumns: [...skippedColsSet],
     };
   }
 
   async insert(record, opts = {}) {
     const manyOpts = {
       ...(opts.format && { format: opts.format }),
+      ...(Array.isArray(opts.skipColumns) && { skipColumns: opts.skipColumns }),
     };
     if (opts.idempotencyKey != null) {
       manyOpts.idempotencyKey = () => String(opts.idempotencyKey);
@@ -392,7 +419,7 @@ class Sheet {
     return { row: result.inserted[0].row, idempotencyHit: null, inserted: true };
   }
 
-  _buildBatchInsertRequests({ startRow, toInsert, rowFormat }) {
+  _buildBatchInsertRequests({ startRow, toInsert, rowFormat, skip }) {
     const sheetId = this.sheetId;
     const startIndex = startRow - 1;
     const N = toInsert.length;
@@ -414,6 +441,7 @@ class Sheet {
     const perRecord = toInsert.map(({ record }) => {
       const cellsByIdx = new Map();
       for (const [header, value] of Object.entries(record)) {
+        if (skip && skip.has(normHeader(header))) continue; // computed column: leave untouched
         const idx = this._col(header);
         if (idx > maxColIdx) maxColIdx = idx;
         cellsByIdx.set(idx, value);
@@ -421,23 +449,41 @@ class Sheet {
       return cellsByIdx;
     });
 
-    const rows = perRecord.map((cellsByIdx, i) => {
-      const targetRow = startRow + i;
-      const values = new Array(maxColIdx + 1).fill(null).map((_, colIdx) =>
-        cellsByIdx.has(colIdx)
-          ? this._encodeValue(cellsByIdx.get(colIdx), targetRow)
-          : { userEnteredValue: { stringValue: "" } }
-      );
-      return { values };
-    });
+    // Computed columns must be left completely untouched (an ARRAYFORMULA in
+    // row 2 spills into the new rows; writing even "" yields #REF!). Resolve them
+    // to absolute indices and write only contiguous runs of writable columns, so
+    // each computed column stays a gap no updateCells covers. issue #12 I5.
+    const skipIdx = new Set();
+    if (skip && skip.size) {
+      for (const [k, idx] of this.headerToIdx) if (skip.has(k)) skipIdx.add(idx);
+    }
+    const segments = [];
+    let seg = null;
+    for (let c = 0; c <= maxColIdx; c++) {
+      if (skipIdx.has(c)) { seg = null; continue; }
+      if (!seg) { seg = { start: c, end: c }; segments.push(seg); }
+      else seg.end = c;
+    }
 
-    requests.push({
-      updateCells: {
-        start: { sheetId, rowIndex: startIndex, columnIndex: 0 },
-        rows,
-        fields: "userEnteredValue",
-      },
-    });
+    for (const { start, end } of segments) {
+      const rows = perRecord.map((cellsByIdx, i) => {
+        const targetRow = startRow + i;
+        const values = [];
+        for (let c = start; c <= end; c++) {
+          values.push(cellsByIdx.has(c)
+            ? this._encodeValue(cellsByIdx.get(c), targetRow)
+            : { userEnteredValue: { stringValue: "" } });
+        }
+        return { values };
+      });
+      requests.push({
+        updateCells: {
+          start: { sheetId, rowIndex: startIndex, columnIndex: start },
+          rows,
+          fields: "userEnteredValue",
+        },
+      });
+    }
 
     if (rowFormat) {
       const { cellFormat, fields } = compileStyle(rowFormat);
@@ -538,6 +584,9 @@ class Sheet {
 
     const targetRows = await this._resolveRows({ rows, where });
     if (targetRows.length === 0) return { updated: 0, rows: [] };
+    if (this.table && targetRows.some(r => r === this.headerRow)) {
+      throw new Error(`update would overwrite the Table header row — use renameColumn to rename typed columns (issue #12 B6)`);
+    }
 
     const requests = [];
     for (const row of targetRows) {
@@ -792,6 +841,140 @@ class Sheet {
   }
 
   /**
+   * Rename a native-Table column COHERENTLY (issue #12 B6). Writing the header
+   * cell directly (updateCells/writeRange) does NOT update the Table's
+   * columnProperties.columnName, which scrambles the column's TYPE binding (a
+   * CURRENCY column silently stays bound to the old name). This routes through
+   * updateTable so name + type stay consistent. Throws outside a Table.
+   */
+  async renameColumn(oldName, newName) {
+    if (!this.table) {
+      throw new Error(`renameColumn: "${this.name}" has no native Table — rename a plain header via writeRange`);
+    }
+    const idx = this._col(oldName);
+    if (idx < this.table.baseColumn || idx >= this.table.endColumn) {
+      throw new Error(`renameColumn: "${oldName}" is outside the table's columns`);
+    }
+    const newKey = normHeader(newName);
+    if (this.headerToIdx.has(newKey) && this.headerToIdx.get(newKey) !== idx) {
+      throw new Error(`renameColumn: "${newName}" collides with an existing header`);
+    }
+    const rel = idx - this.table.baseColumn;
+    // Clone + mutate columnName only — never recompile from { name }, which would
+    // drop columnType / dataValidationRule.
+    const cols = this.table.columnProperties.map(cp => ({ ...cp }));
+    let target = cols.find(cp => (cp.columnIndex ?? 0) === rel);
+    if (!target) { target = { columnIndex: rel }; cols.push(target); }
+    target.columnName = newName;
+    await this.client.batchUpdate(
+      this.spreadsheetId,
+      buildUpdateTable({ tableId: this.table.tableId, columnProperties: cols }, "columnProperties"),
+    );
+    this.table.columnProperties = cols;
+    await this._init();
+    return { ok: true, table: true, from: oldName, to: newName };
+  }
+
+  /** Throw if a write/format range would overwrite a Table header cell — the
+   *  caller should use renameColumn instead (issue #12 B6). No-op off a Table. */
+  _assertNoTableHeaderWrite(grid) {
+    if (!this.table) return;
+    const hr = this.headerRow - 1;
+    const rs = grid.startRowIndex ?? -Infinity;
+    const re = grid.endRowIndex ?? Infinity;
+    if (hr < rs || hr >= re) return; // doesn't touch the header row
+    const cs = grid.startColumnIndex ?? -Infinity;
+    const ce = grid.endColumnIndex ?? Infinity;
+    if (cs < this.table.endColumn && this.table.baseColumn < ce) {
+      throw new Error(
+        `writeRange would overwrite a Table header cell — use renameColumn(old, new) ` +
+        `to rename a typed column (keeps columnProperties in sync)`,
+      );
+    }
+  }
+
+  /**
+   * Unmerge every merge OVERLAPPING the range, at its FULL extent, in one batch
+   * (issue #12 I6). Plain unmerge over a range that only partially covers a merge
+   * fails ("You must select all cells in a merged range"); this resolves the real
+   * merge rectangles first. Returns { cleared } (0 ⇒ no API call).
+   */
+  async clearMerges(range) {
+    const target = a1ToGridRange(this.sheetId, range);
+    const meta = await this.client.getSpreadsheet(this.spreadsheetId);
+    const sheet = (meta.sheets || []).find(s => s.properties?.sheetId === this.sheetId);
+    const merges = (sheet?.merges || []).filter(m => gridRangesOverlap(m, target));
+    if (merges.length === 0) return { cleared: 0 };
+    const requests = merges.flatMap(m => buildUnmerge(m));
+    await this.client.batchUpdate(this.spreadsheetId, requests);
+    return { cleared: merges.length };
+  }
+
+  /**
+   * Link-aware read (issue #12 B2): per-cell value + embedded hyperlink for an
+   * A1 range. Plain readRange/valuesGet strip hyperlinks. Returns a 2D array of
+   * { value, hyperlink, links? } where `links` (when present) are rich-text run
+   * links [{ start, uri }]. Reuses readFormatting (widening its field mask).
+   */
+  async readLinks(a1) {
+    const mask =
+      "sheets(data(startRow,startColumn,rowData(values(" +
+      "formattedValue,effectiveValue,hyperlink,textFormatRuns(startIndex,format(link(uri)))))))";
+    const { data } = await this.readFormatting(a1, { fields: mask });
+    const rowData = (data[0] || {}).rowData || [];
+    return rowData.map(rd => (rd.values || []).map(cell => {
+      const out = { value: cellLinkValue(cell), hyperlink: cell?.hyperlink ?? null };
+      const links = (cell?.textFormatRuns || [])
+        .filter(r => r?.format?.link?.uri)
+        .map(r => ({ start: r.startIndex ?? 0, uri: r.format.link.uri }));
+      if (links.length) out.links = links;
+      return out;
+    }));
+  }
+
+  /**
+   * Set a single cell to a hyperlink (issue #12 B2). Emits =HYPERLINK("url","text")
+   * via the USER_ENTERED value path — the only method that reliably persists a
+   * link (writing textFormatRuns[].format.link.uri through updateCells no-ops).
+   * text defaults to url.
+   */
+  async setLink(a1, url, text) {
+    const label = text == null ? url : text;
+    const formula = `=HYPERLINK(${quoteFormulaString(url)},${quoteFormulaString(label)})`;
+    return this.writeRange(a1, [[formula]]);
+  }
+
+  /**
+   * Rewrite a column/range while PRESERVING embedded hyperlinks (issue #12 B2).
+   * Reads existing values+links via readLinks, applies mapFn per cell, writes
+   * back in one atomic writeRange. A cell whose source had a hyperlink (and whose
+   * mapFn didn't supply its own url) is re-emitted as =HYPERLINK(origUri, text)
+   * so the link survives. mapFn: ({ value, hyperlink, row, col }) => string |
+   * { text, url } | null. Returns the writeRange result + { linksPreserved }.
+   */
+  async rebuildColumn(a1, mapFn, { preserveLinks = true } = {}) {
+    const grid = await this.readLinks(a1);
+    let linksPreserved = 0;
+    const values = grid.map((row, r) => row.map((cell, c) => {
+      const mapped = mapFn ? mapFn({ value: cell.value, hyperlink: cell.hyperlink, row: r, col: c }) : cell.value;
+      let text = mapped, url = null;
+      if (mapped && typeof mapped === "object") { text = mapped.text; url = mapped.url ?? null; }
+      if (url == null && preserveLinks && cell.hyperlink) url = cell.hyperlink;
+      if (url != null) {
+        linksPreserved++;
+        const label = text == null ? url : text;
+        return `=HYPERLINK(${quoteFormulaString(url)},${quoteFormulaString(label)})`;
+      }
+      return text == null ? "" : text;
+    }));
+    if (values.length === 0 || !Array.isArray(values[0]) || values[0].length === 0) {
+      return { updatedRange: `${quoteSheetName(this.name)}!${a1}`, updatedCells: 0, linksPreserved: 0 };
+    }
+    const res = await this.writeRange(a1, values);
+    return { ...res, linksPreserved };
+  }
+
+  /**
    * Richer read: pull formatting, notes, merges, validation and hyperlinks for
    * an arbitrary A1 range. Returns { data, merges } from the Sheets grid data.
    */
@@ -805,9 +988,18 @@ class Sheet {
     return { data: sheet.data || [], merges: sheet.merges || [] };
   }
 
-  async readRange(a1, { valueRender = "UNFORMATTED_VALUE" } = {}) {
+  /**
+   * Raw A1 read. opts.valueRender: "UNFORMATTED_VALUE" (default) |
+   * "FORMATTED_VALUE" | "FORMULA". For big reads, page with { limit, offset }
+   * (row-based, applied to the returned rows) to stay under output-size caps
+   * (issue #12 I1).
+   */
+  async readRange(a1, { valueRender = "UNFORMATTED_VALUE", limit, offset } = {}) {
     const range = `${quoteSheetName(this.name)}!${a1}`;
-    return this.client.valuesGet(this.spreadsheetId, range, { valueRenderOption: valueRender });
+    const rows = await this.client.valuesGet(this.spreadsheetId, range, { valueRenderOption: valueRender });
+    if (limit == null && offset == null) return rows;
+    const start = offset ?? 0;
+    return limit == null ? rows.slice(start) : rows.slice(start, start + limit);
   }
 
   /**
@@ -821,6 +1013,7 @@ class Sheet {
     if (!Array.isArray(values) || !Array.isArray(values[0])) {
       throw new Error("writeRange: values must be a 2D array");
     }
+    this._assertNoTableHeaderWrite(a1ToGridRange(this.sheetId, a1));
     const hasStructuredRef = values.some(
       row => Array.isArray(row) && row.some(v => typeof v === "string" && /^=.*\[(@|\[)/.test(v)),
     );
@@ -917,4 +1110,18 @@ export function indexHeaders(headers) {
 function quoteSheetName(name) {
   if (/^[A-Za-z_][A-Za-z0-9_]*$/.test(name)) return name;
   return `'${name.replace(/'/g, "''")}'`;
+}
+
+/** A cell's effective scalar value (for link-aware reads), preferring
+ *  effectiveValue then formattedValue. */
+function cellLinkValue(cell) {
+  if (!cell) return null;
+  const ev = cell.effectiveValue;
+  if (ev) return ev.stringValue ?? ev.numberValue ?? ev.boolValue ?? ev.formulaValue ?? null;
+  return cell.formattedValue ?? null;
+}
+
+/** Quote a string as a Sheets formula string literal (doubling internal "). */
+function quoteFormulaString(s) {
+  return `"${String(s).replace(/"/g, '""')}"`;
 }

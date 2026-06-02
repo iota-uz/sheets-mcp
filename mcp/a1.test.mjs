@@ -1,6 +1,21 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
-import { colLetter, colToIdx, a1ToGridRange, gridRangeToA1 } from "./a1.mjs";
+import { colLetter, colToIdx, a1ToGridRange, gridRangeToA1, gridRangesOverlap } from "./a1.mjs";
+
+test("gridRangesOverlap — partial, contained, edge-touch, disjoint", () => {
+  const a = { sheetId: 1, startRowIndex: 0, endRowIndex: 3, startColumnIndex: 0, endColumnIndex: 3 }; // A1:C3
+  assert.equal(gridRangesOverlap(a, { sheetId: 1, startRowIndex: 1, endRowIndex: 5, startColumnIndex: 1, endColumnIndex: 2 }), true);  // partial
+  assert.equal(gridRangesOverlap(a, { sheetId: 1, startRowIndex: 1, endRowIndex: 2, startColumnIndex: 1, endColumnIndex: 2 }), true);  // contained
+  assert.equal(gridRangesOverlap(a, { sheetId: 1, startRowIndex: 3, endRowIndex: 5, startColumnIndex: 0, endColumnIndex: 3 }), false); // touches bottom edge (half-open)
+  assert.equal(gridRangesOverlap(a, { sheetId: 1, startRowIndex: 10, endRowIndex: 12, startColumnIndex: 10, endColumnIndex: 12 }), false); // disjoint
+});
+
+test("gridRangesOverlap — different sheets never overlap; unbounded edges", () => {
+  const a = { sheetId: 1, startRowIndex: 0, endRowIndex: 3, startColumnIndex: 0, endColumnIndex: 3 };
+  assert.equal(gridRangesOverlap(a, { sheetId: 2, startRowIndex: 0, endRowIndex: 3, startColumnIndex: 0, endColumnIndex: 3 }), false);
+  // a full-column range (no row bounds) overlaps anything in its columns
+  assert.equal(gridRangesOverlap(a, { sheetId: 1, startColumnIndex: 1, endColumnIndex: 2 }), true);
+});
 
 test("gridRangeToA1 — bounded range round-trips with a1ToGridRange", () => {
   const range = { sheetId: 4, startRowIndex: 0, endRowIndex: 6, startColumnIndex: 0, endColumnIndex: 9 };

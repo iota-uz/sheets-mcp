@@ -13,6 +13,7 @@
 import vm from "vm";
 import { makeClient } from "./sheets-client.mjs";
 import { makeSheetsApi } from "./sheets-api.mjs";
+import { lintPlannedOps } from "./lint-requests.mjs";
 
 export async function exec(spreadsheetId, code, { dryRun = false, timeoutMs = 30000 } = {}) {
   if (!spreadsheetId) throw new Error("exec requires a spreadsheetId");
@@ -70,9 +71,21 @@ export async function exec(spreadsheetId, code, { dryRun = false, timeoutMs = 30
       dryRun: true,
       // Ordered log of every intended mutation, each tagged with its `kind`
       // ("batchUpdate" → { requests } | "valuesUpdate" → { range, values }).
+      // NOTE: this is a JS-only preview — the requests were NEVER sent, so
+      // Google has not validated them. A committing (non-dryRun) call is what
+      // Google validates, atomically (all requests apply or none do).
       plannedOps: capture,
+      // Best-effort, non-exhaustive structural lint of the planned requests
+      // (missing required fields, etc.). Empty does NOT mean the live call will
+      // succeed. Guarded so a linter bug can never fail a dry-run.
+      plannedOpsWarnings: safeLint(capture),
     }),
   };
+}
+
+function safeLint(capture) {
+  try { return lintPlannedOps(capture); }
+  catch { return []; }
 }
 
 function stringify(v) {

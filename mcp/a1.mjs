@@ -117,6 +117,22 @@ export function gridRangeToA1(title, range) {
   return `${quoteSheetTitle(title)}!${start}:${end}`;
 }
 
+/**
+ * Do two GridRanges overlap? Half-open [start,end) index math; a missing bound
+ * is treated as unbounded (−∞ start / +∞ end), matching how Sheets interprets an
+ * omitted GridRange edge. Ranges on different sheetIds never overlap. Pure.
+ */
+export function gridRangesOverlap(a, b) {
+  if (!a || !b) return false;
+  if (a.sheetId != null && b.sheetId != null && a.sheetId !== b.sheetId) return false;
+  const lo = (v) => (v == null ? -Infinity : v);
+  const hi = (v) => (v == null ? Infinity : v);
+  return (
+    lo(a.startRowIndex) < hi(b.endRowIndex) && lo(b.startRowIndex) < hi(a.endRowIndex) &&
+    lo(a.startColumnIndex) < hi(b.endColumnIndex) && lo(b.startColumnIndex) < hi(a.endColumnIndex)
+  );
+}
+
 export function a1ToGridRange(sheetId, a1) {
   if (typeof a1 !== "string" || a1.trim() === "") {
     throw new Error(`a1ToGridRange: expected a non-empty A1 string, got ${JSON.stringify(a1)}`);

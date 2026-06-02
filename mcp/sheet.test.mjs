@@ -74,10 +74,10 @@ test("ambiguous header throws on use, but describe() still lists all", async () 
 
 const PUBLIC_METHODS = [
   "describe", "find", "insert", "insertMany", "update", "delete", "format", "formatRange",
-  "merge", "unmerge", "setBorders", "addConditionalFormat", "freeze", "resizeColumns",
+  "merge", "unmerge", "clearMerges", "setBorders", "addConditionalFormat", "freeze", "resizeColumns",
   "insertColumns", "deleteColumns", "sort", "setFilter", "findReplace", "setNote",
-  "setValidation", "readFormatting", "readRange", "writeRange",
-  "setRowHeight", "copyFormat", "toTable",
+  "setValidation", "renameColumn", "readFormatting", "readRange", "readLinks", "writeRange",
+  "setLink", "rebuildColumn", "setRowHeight", "copyFormat", "toTable",
 ];
 
 test("a deleted handle throws on every public method", async () => {
@@ -224,4 +224,140 @@ test("toTable builds an addTable request from the header range (issue #10 #3)", 
   assert.equal(add.addTable.table.range.endColumnIndex, 3);
   assert.equal(add.addTable.table.columnProperties[1].columnType, "DOUBLE");
   assert.equal(res.tableId, "tbl_new");
+});
+
+// ── issue #12 B6: table column rename + header-write guard ────────────────────
+
+test("renameColumn routes through updateTable and preserves columnType (B6)", async () => {
+  const client = fakeClient({ sheets: [TABLE_SHEET] });
+  const s = await createSheet("SS", "Об", {}, client);
+  const res = await s.renameColumn("Категория", "Кат");
+  assert.deepEqual(res, { ok: true, table: true, from: "Категория", to: "Кат" });
+
+  const reqs = client.calls.filter(c => c.method === "batchUpdate").at(-1).requests;
+  assert.ok(reqs[0].updateTable, "should be an updateTable request");
+  assert.equal(reqs[0].updateTable.fields, "columnProperties");
+  const renamed = reqs[0].updateTable.table.columnProperties.find(c => c.columnName === "Кат");
+  assert.equal(renamed.columnType, "DROPDOWN");           // type binding preserved
+  assert.equal(reqs.some(r => r.updateCells), false);     // no raw header write
+});
+
+test("renameColumn on a plain sheet throws (B6)", async () => {
+  const client = fakeClient({ sheets: [{ sheetId: 1, title: "T", headers: ["A"] }] });
+  const s = await createSheet("SS", "T", {}, client);
+  await assert.rejects(s.renameColumn("A", "B"), /no native Table/);
+});
+
+test("writeRange into a Table header row throws and names renameColumn (B6)", async () => {
+  const client = fakeClient({ sheets: [TABLE_SHEET] });
+  const s = await createSheet("SS", "Об", {}, client);
+  await assert.rejects(s.writeRange("A1", [["x"]]), /renameColumn/);
+  await assert.doesNotReject(s.writeRange("A2", [["x"]]));  // below header is fine
+});
+
+// ── issue #12 I5: computed columns skipped on insert ─────────────────────────
+
+test("insert skips computedColumns and reports skippedColumns (I5)", async () => {
+  const client = fakeClient({ sheets: [{ sheetId: 1, title: "T", headers: ["Name", "Total"] }], values: [] });
+  const s = await createSheet("SS", "T", { computedColumns: ["Total"] }, client);
+  const res = await s.insertMany([{ Name: "x", Total: 5 }]);
+  assert.deepEqual(res.skippedColumns, ["Total"]);
+
+  const bu = client.calls.filter(c => c.method === "batchUpdate").at(-1);
+  const uc = bu.requests.filter(r => r.updateCells);
+  // every written cell block stays left of the computed column (index 1)
+  for (const r of uc) {
+    const end = r.updateCells.start.columnIndex + r.updateCells.rows[0].values.length;
+    assert.ok(r.updateCells.start.columnIndex <= 0 && end <= 1, "Total column must not be written");
+  }
+});
+
+test("insert leaves a MIDDLE computed column untouched via segmented writes (I5)", async () => {
+  const client = fakeClient({ sheets: [{ sheetId: 1, title: "T", headers: ["A", "Mid", "B"] }], values: [] });
+  const s = await createSheet("SS", "T", { computedColumns: ["Mid"] }, client);
+  await s.insertMany([{ A: 1, Mid: 9, B: 2 }]);
+
+  const uc = client.calls.filter(c => c.method === "batchUpdate").at(-1).requests.filter(r => r.updateCells);
+  assert.equal(uc.length, 2, "two segments: before and after the computed column");
+  // no segment covers column index 1 (Mid)
+  for (const r of uc) {
+    const start = r.updateCells.start.columnIndex;
+    const end = start + r.updateCells.rows[0].values.length;
+    assert.ok(end <= 1 || start >= 2, `segment [${start},${end}) must skip Mid (col 1)`);
+  }
+});
+
+// ── issue #12 I1: readRange pagination ───────────────────────────────────────
+
+test("readRange paginates with { limit, offset } (I1)", async () => {
+  const rows = Array.from({ length: 100 }, (_, i) => [i]);
+  const client = fakeClient({ sheets: [{ sheetId: 1, title: "T", headers: ["A"] }], values: rows });
+  const s = await createSheet("SS", "T", {}, client);
+  const page = await s.readRange("A2:A", { limit: 10, offset: 20 });
+  assert.equal(page.length, 10);
+  assert.deepEqual(page[0], [20]);
+  assert.deepEqual(page.at(-1), [29]);
+});
+
+// ── issue #12 I6: clearMerges auto-expands to full merge extents ─────────────
+
+test("clearMerges unmerges the FULL merge a partial range overlaps (I6)", async () => {
+  const client = fakeClient({ sheets: [{ sheetId: 1, title: "T", headers: ["A", "B", "C"] }] });
+  const merge = { sheetId: 1, startRowIndex: 0, endRowIndex: 3, startColumnIndex: 0, endColumnIndex: 3 }; // A1:C3
+  client.getSpreadsheet = async (id) => ({ spreadsheetId: id, sheets: [{ properties: { sheetId: 1 }, merges: [merge] }] });
+  const s = await createSheet("SS", "T", {}, client);
+
+  const res = await s.clearMerges("B2:B5"); // only partially covers the merge
+  assert.deepEqual(res, { cleared: 1 });
+  const reqs = client.calls.filter(c => c.method === "batchUpdate").at(-1).requests;
+  assert.deepEqual(reqs[0].unmergeCells.range, merge); // full extent, not B2:B5
+});
+
+test("clearMerges with no overlap makes no API call (I6)", async () => {
+  const client = fakeClient({ sheets: [{ sheetId: 1, title: "T", headers: ["A"] }] });
+  client.getSpreadsheet = async (id) => ({ spreadsheetId: id, sheets: [{ properties: { sheetId: 1 }, merges: [{ sheetId: 1, startRowIndex: 10, endRowIndex: 12, startColumnIndex: 10, endColumnIndex: 12 }] }] });
+  const s = await createSheet("SS", "T", {}, client);
+  const res = await s.clearMerges("A1:B2");
+  assert.deepEqual(res, { cleared: 0 });
+  assert.equal(client.calls.some(c => c.method === "batchUpdate"), false);
+});
+
+// ── issue #12 B2: link-aware read / link-preserving write ────────────────────
+
+test("readLinks returns per-cell value + hyperlink + run links (B2)", async () => {
+  const client = fakeClient({ sheets: [{ sheetId: 1, title: "T", headers: ["A"] }] });
+  const s = await createSheet("SS", "T", {}, client);
+  // Override AFTER _init so the link-bearing grid only feeds readLinks.
+  client.spreadsheetsGet = async () => ({ sheets: [{ data: [{ rowData: [
+    { values: [
+      { effectiveValue: { stringValue: "here" }, hyperlink: "https://x", textFormatRuns: [{ startIndex: 0, format: { link: { uri: "https://x" } } }] },
+      { effectiveValue: { numberValue: 5 } },
+    ] },
+  ] }] }] });
+  const grid = await s.readLinks("A1:B1");
+  assert.deepEqual(grid[0][0], { value: "here", hyperlink: "https://x", links: [{ start: 0, uri: "https://x" }] });
+  assert.deepEqual(grid[0][1], { value: 5, hyperlink: null });
+});
+
+test("setLink writes a =HYPERLINK formula, escaping quotes (B2)", async () => {
+  const client = fakeClient({ sheets: [{ sheetId: 1, title: "T", headers: ["A"] }] });
+  let written;
+  client.valuesUpdate = async (id, range, values) => { written = values; return { updatedRange: range }; };
+  const s = await createSheet("SS", "T", {}, client);
+  await s.setLink("C4", 'http://x?a="b"', 'qu"ote');
+  assert.deepEqual(written, [['=HYPERLINK("http://x?a=""b""","qu""ote")']]);
+});
+
+test("rebuildColumn preserves an existing hyperlink while rewriting text (B2)", async () => {
+  const client = fakeClient({ sheets: [{ sheetId: 1, title: "T", headers: ["A"] }] });
+  const s = await createSheet("SS", "T", {}, client);
+  client.spreadsheetsGet = async () => ({ sheets: [{ data: [{ rowData: [
+    { values: [{ effectiveValue: { stringValue: "old" }, hyperlink: "https://keep" }] },
+    { values: [{ effectiveValue: { stringValue: "plain" } }] },
+  ] }] }] });
+  let written;
+  client.valuesUpdate = async (id, range, values) => { written = values; return { updatedRange: range }; };
+  const res = await s.rebuildColumn("A1:A2", ({ value }) => value.toUpperCase());
+  assert.equal(res.linksPreserved, 1);
+  assert.deepEqual(written, [['=HYPERLINK("https://keep","OLD")'], ["PLAIN"]]);
 });

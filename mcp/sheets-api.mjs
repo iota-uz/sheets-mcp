@@ -145,6 +145,57 @@ export function makeSheetsApi(spreadsheetId, client) {
     return out;
   }
 
+  /**
+   * Remove a native Table. Google's DeleteTableRequest ALSO clears the table's
+   * cell data (header + all rows) — silent data loss (issue #11). So by default
+   * we read the cells (value + format + note), delete the table, and restore
+   * them in one atomic batchUpdate, mirroring the Sheets UI "Delete table"
+   * (which keeps data). Pass { deleteData: true } for Google's native behavior
+   * (clears the range too). Structured-reference formulas ([@[Col]]) can't
+   * survive the table's removal — an inherent Sheets limitation.
+   */
+  async function deleteTable(nameOrId, opts = {}) {
+    const { tableId, range, sheetTitle } = await resolveTable(nameOrId);
+
+    if (opts.deleteData) {
+      await client.batchUpdate(spreadsheetId, buildDeleteTable(tableId));
+      return { ok: true, tableId, preserved: false };
+    }
+
+    // Read the table's current cells so we can restore them after the delete.
+    let rows = [];
+    if (range && sheetTitle) {
+      const a1 = gridRangeToA1(sheetTitle, range);
+      const data = await client.spreadsheetsGet(spreadsheetId, {
+        ranges: [a1],
+        includeGridData: true,
+        fields: "sheets(data(rowData(values(userEnteredValue,userEnteredFormat,note))))",
+      });
+      rows = data?.sheets?.[0]?.data?.[0]?.rowData ?? [];
+    }
+
+    const requests = buildDeleteTable(tableId);
+    if (rows.length > 0) {
+      requests.push(...buildRestoreCells(range, rows));
+    }
+    await client.batchUpdate(spreadsheetId, requests);
+    return { ok: true, tableId, preserved: true, rows: rows.length };
+  }
+
+  /**
+   * Convert a native Table back to a styled PLAIN range WITHOUT data loss
+   * (issue #12 B4). Reuses deleteTable's preserve path. Use this to escape the
+   * "setDataValidation is not allowed on cells in typed columns" limit: after
+   * untable the range is plain, so sheet.setValidation applies raw rules again.
+   * Cell formatting survives; the Table's BANDING does not (re-style with
+   * sheet.format / sheet.setBorders).
+   */
+  async function untable(nameOrId) {
+    const { range } = await resolveTable(nameOrId);
+    const r = await deleteTable(nameOrId); // default = preserve cells
+    return { ok: true, tableId: r.tableId, range, rows: r.rows ?? 0, untabled: true };
+  }
+
   return {
     // ── per-sheet handles ──
     sheet: getSheet,
@@ -236,41 +287,7 @@ export function makeSheetsApi(spreadsheetId, client) {
       return { ok: true, tableId };
     },
 
-    /**
-     * Remove a native Table. Google's DeleteTableRequest ALSO clears the table's
-     * cell data (header + all rows) — silent data loss (issue #11). So by default
-     * we read the cells (value + format + note), delete the table, and restore
-     * them in one atomic batchUpdate, mirroring the Sheets UI "Delete table"
-     * (which keeps data). Pass { deleteData: true } for Google's native behavior
-     * (clears the range too). Structured-reference formulas ([@[Col]]) can't
-     * survive the table's removal — an inherent Sheets limitation.
-     */
-    async deleteTable(nameOrId, opts = {}) {
-      const { tableId, range, sheetTitle } = await resolveTable(nameOrId);
-
-      if (opts.deleteData) {
-        await client.batchUpdate(spreadsheetId, buildDeleteTable(tableId));
-        return { ok: true, tableId, preserved: false };
-      }
-
-      // Read the table's current cells so we can restore them after the delete.
-      let rows = [];
-      if (range && sheetTitle) {
-        const a1 = gridRangeToA1(sheetTitle, range);
-        const data = await client.spreadsheetsGet(spreadsheetId, {
-          ranges: [a1],
-          includeGridData: true,
-          fields: "sheets(data(rowData(values(userEnteredValue,userEnteredFormat,note))))",
-        });
-        rows = data?.sheets?.[0]?.data?.[0]?.rowData ?? [];
-      }
-
-      const requests = buildDeleteTable(tableId);
-      if (rows.length > 0) {
-        requests.push(...buildRestoreCells(range, rows));
-      }
-      await client.batchUpdate(spreadsheetId, requests);
-      return { ok: true, tableId, preserved: true, rows: rows.length };
-    },
+    deleteTable,
+    untable,
   };
 }

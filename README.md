@@ -71,13 +71,16 @@ Execute JavaScript against the typed Sheet API in a sandboxed `vm` context. The 
 |-----------------|-----------|---------|--------------------------------------------------------|
 | `spreadsheetId` | `string`  | —       | **Required.** Bound to the `sheets` global for this call. |
 | `code`          | `string`  | —       | **Required.** JS to execute. Has access to `sheets`, `console`, JS builtins. |
-| `dryRun`        | `boolean` | `false` | If true, every mutation is recorded — not sent — into `plannedOps[]`, an ordered log of each intended op (batchUpdate bodies + `writeRange` value writes), tagged with its `kind`. |
+| `dryRun`        | `boolean` | `false` | If true, every mutation is recorded — not sent — into `plannedOps[]`, an ordered log of each intended op (batchUpdate bodies + `writeRange` value writes), tagged with its `kind`. **This is a JS-only preview** — the requests are never sent, so Google does not validate them; `plannedOpsWarnings[]` carries a best-effort, non-exhaustive structural lint. A committing run is what Google validates, atomically (all requests apply or none do). |
+| `maxBytes`      | `number`  | `50000` | Soft cap on the serialized `result` size (chars). Over the cap, `result` is replaced with a preview plus `truncationHint`. `0` disables the cap (full result). |
+| `head`          | `number`  | —       | If `result` is an array, keep only the first `head` rows before the size cap. |
 | `timeoutMs`     | `number`  | `30000` | Execution timeout in milliseconds.                     |
 
 The `sheets` global (bound to the call's `spreadsheetId`):
 
 ```ts
-sheets.sheet(name: string, opts?: { headerRow?: number }): Promise<Sheet>
+sheets.sheet(name: string, opts?: { headerRow?: number, computedColumns?: string[] }): Promise<Sheet>
+   // computedColumns: header names never written on insert (ARRAYFORMULA spills, formulas)
 sheets.spreadsheetId(): string
 
 // Structural ops — create / manage tabs (no human in the browser needed)
@@ -98,10 +101,18 @@ sheets.updateTable(nameOrId, { name?, columns?, range? }): Promise<{ ok, tableId
 sheets.deleteTable(nameOrId, { deleteData? }): Promise<{ ok, tableId, preserved, rows }>
    // removes the table but KEEPS its cells (values/format/notes) by default;
    // pass { deleteData: true } for Google's native behavior, which also clears the range
+sheets.untable(nameOrId): Promise<{ ok, tableId, range, rows }>
+   // drop the Table wrapper, KEEP the data (styled plain range). Regains setDataValidation
+   // on those cells (typed Table columns reject raw validation). Cell formatting survives;
+   // Table banding does not. NOTE: native Tables force the spreadsheet's LOCALE number
+   // formatting (CURRENCY symbol, DATE pattern) — not API-overridable; for custom currency/
+   // date formats use a styled plain range (formatRange + setBorders), or untable() a Table.
 
 // Raw escape hatch — full Sheets v4 power for anything not covered by the sugar
-sheets.batchUpdate(requests): Promise<...>          // any Request[], dry-run aware
-sheets.valuesBatchGet(ranges, opts?): Promise<...>  // multi-range read, one round trip
+sheets.batchUpdate(requests): Promise<...>          // any Request[], dry-run aware; on failure
+                                                    // the error names the op + A1 range
+sheets.valuesBatchGet(ranges, opts?): Promise<Array<{ range, majorDimension, values: any[][] }>>
+   // one entry per input range, in order; `values` is ALWAYS present ([] for an empty range)
 sheets.getSpreadsheet(opts?): Promise<...>          // metadata: all sheets, named ranges, …
 sheets.developerMetadataSearch(filters): Promise<...>
 ```
@@ -113,14 +124,15 @@ sheet.describe(): { sheet, sheetId, headerRow, rowCount, headers, table? }
    table (when the tab has a native Table): { tableId, name, columns: [{ name, type, letter }] }
 sheet.toTable(name, { columns?, rows? }): Promise<{ tableId, name }>   // wrap this tab as a Table
 
-sheet.insertMany(records, opts?): Promise<{ inserted, skipped, rows }>
+sheet.insertMany(records, opts?): Promise<{ inserted, skipped, rows, skippedColumns }>
    records: Array<{ "Header text": value | "=formula" }>
-   opts:    { idempotencyKey?: (record, i) => string, format?: StyleObject }
-   N records → ONE batchUpdate. Use this for any batch.
+   opts:    { idempotencyKey?: (record, i) => string, format?: StyleObject, skipColumns?: string[] }
+   N records → ONE batchUpdate. Use this for any batch. Computed columns (declared via
+   computedColumns or per-call skipColumns) are left untouched and reported in skippedColumns.
 
 sheet.insert(record, opts?): Promise<{ row, inserted, idempotencyHit }>
    Sugar over insertMany for one record.
-   opts: { idempotencyKey?: string, format?: StyleObject }
+   opts: { idempotencyKey?: string, format?: StyleObject, skipColumns?: string[] }
 
 sheet.find(where): Promise<Array<{ row, "Header": value, ... }>>
 sheet.update({ where?, rows?, set }): Promise<{ updated, rows }>
@@ -131,6 +143,8 @@ sheet.format({ where?, rows?, range?, set }): Promise<{ formatted, rows }>
    where/rows style whole rows; pass `range` (A1) to style an arbitrary range.
 sheet.formatRange(a1, style): Promise<...>          // any range/column: "B2:D10", "C:C"
 sheet.merge(range, type?) / sheet.unmerge(range)    // type: MERGE_ALL|MERGE_COLUMNS|MERGE_ROWS
+sheet.clearMerges(range): Promise<{ cleared }>      // unmerge every merge OVERLAPPING the range,
+                                                    // at full extent (handles partial overlap)
 sheet.setBorders(range, spec)                       // "all" | "outer" | "DASHED" | { top?, …, style?, color? }
 sheet.addConditionalFormat(range, rule)             // { condition, format } | { gradient: { min, mid?, max } }
 sheet.freeze({ rows?, cols? })
@@ -151,12 +165,21 @@ sheet.setValidation(header, spec): Promise<{ ok }>
    (+ optional strict?, showCustomUi?)
    On a native-Table typed column, auto-routes to updateTable (raw setDataValidation
    is rejected on typed columns).
+sheet.renameColumn(oldName, newName): Promise<{ ok, table, from, to }>
+   // rename a native-Table column COHERENTLY (keeps columnProperties/type in sync).
+   // Writing a Table header cell directly desyncs column types — use this instead.
 
-sheet.readRange(a1, { valueRender? }): Promise<any[][]>
+sheet.readRange(a1, { valueRender?, limit?, offset? }): Promise<any[][]>   // page big reads with limit/offset
 sheet.readFormatting(a1, opts?): Promise<{ data, merges }>   // formatting, notes, merges, validation
+sheet.readLinks(a1): Promise<Array<Array<{ value, hyperlink, links? }>>>
+   // link-aware read — plain readRange/values STRIP embedded hyperlinks
+sheet.setLink(a1, url, text?): Promise<...>          // set a cell to a link via =HYPERLINK
+sheet.rebuildColumn(a1, mapFn, opts?): Promise<{ ..., linksPreserved }>
+   // rewrite a range PRESERVING hyperlinks; mapFn: ({value,hyperlink,row,col}) => string|{text,url}|null
 sheet.writeRange(a1, values2d, { raw?, bind? }): Promise<{ updatedRange, updatedCells, ... }>
    // Table structured refs (=…[@[Col]]…) auto-route through updateCells so they
    // bind in row context instead of #ERROR!; bind:true forces it, raw:true skips.
+   // Writing a Table HEADER cell is blocked — use renameColumn (keeps types in sync).
 ```
 
 Pass `rows: [123, 456]` to `update/delete/format` to skip the `find()` lookup when row numbers are already known. Every mutating method compiles to `batchUpdate` (or a guarded value write) and therefore respects `dryRun`.
@@ -235,6 +258,8 @@ await s.freeze({ rows: 1 });
 
 Pass `dryRun: true` to `sheets_exec` to capture every intended mutation without committing. The response carries `plannedOps[]` — an ordered log of every intended op, each tagged with its `kind` (`"batchUpdate"` with `requests`, or `"valuesUpdate"` with `range`/`values`).
 
+`plannedOps` is a **JS-only preview**: the requests were never sent, so Google has **not** validated them — an empty `plannedOpsWarnings[]` (a best-effort, non-exhaustive structural lint) does not guarantee a live run will succeed. The committing (non-dry-run) call is what Google validates, and it does so atomically: every request in a batch applies, or none do.
+
 ## Architecture
 
 The agent doesn't issue per-cell tool calls. It writes a JS script against the typed `Sheet` API; the runner compiles each script to **one atomic `spreadsheets.batchUpdate`**.
@@ -273,6 +298,8 @@ Each `sheets_exec` call runs against its own client and handle registry, so:
 - **GoogleFinance / volatile cells read as `#N/A`.** `GOOGLEFINANCE`, `IMPORT*`, and historical lookups compute only in the browser; the API returns `#N/A` for them, and a nearby write can invalidate a previously-cached value. This is Google's behavior, not a server error — don't treat `#N/A` from these as a failure; verify in the UI.
 - **Table structured references must bind in row context.** A formula like `=IF([@[Сумма]]=…)` written through the plain values path renders `#ERROR!`. `writeRange` detects structured refs and auto-routes them through `updateCells` (which binds correctly); `opts.raw: true` skips that and stores the formula verbatim.
 - **Table dropdown chip ↔ arrow display is UI-only.** The chip vs. arrow toggle isn't in the Sheets API — native Table dropdown columns always render as chips. An arrow-style dropdown needs a non-Table range plus a manual UI toggle.
+- **Plain value reads/writes don't carry hyperlinks.** `readRange`/`valuesBatchGet` return only display text, and a `writeRange`/`updateCells` rewrite destroys embedded links (writing `textFormatRuns[].format.link.uri` silently no-ops). Use `readLinks` to read links, and `setLink` / `rebuildColumn` (which emit `=HYPERLINK()`, the only reliably-persisting form) to write or preserve them.
+- **Native Tables force locale number formatting.** Typed Table columns render `CURRENCY`/`DATE` in the spreadsheet's locale (local currency symbol, locale date pattern), not overridable via the API. For custom currency/date formats use a styled plain range (`formatRange` + `setBorders`), or `sheets.untable(name)` to drop the Table wrapper while keeping the data.
 
 ## Release (maintainers)
 

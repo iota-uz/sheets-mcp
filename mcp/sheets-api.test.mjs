@@ -185,6 +185,31 @@ test("deleteTable on an empty-body table emits only deleteTable", async () => {
   assert.deepEqual(requests[0].deleteTable, { tableId: "t1" });
 });
 
+// issue #12 B4: untable() — drop the Table wrapper, keep the data (reuses the
+// #11 preserve path; no setDataValidation emitted).
+test("untable preserves cells and emits deleteTable + restore (issue #12 B4)", async () => {
+  const client = fakeClient({ sheets: [{ sheetId: 4, title: "Data", headers: ["A", "B"], tables: boundedTable() }] });
+  const api = makeSheetsApi("SS", client);
+
+  const res = await api.untable("Об");
+  assert.deepEqual(res, { ok: true, tableId: "t1", range: boundedTable()[0].range, rows: 1, untabled: true });
+
+  const { requests } = client.calls.at(-1);
+  assert.deepEqual(requests[0].deleteTable, { tableId: "t1" });
+  assert.ok(requests[1].updateCells, "expected a restore updateCells");
+  assert.equal(requests.some(r => r.setDataValidation), false);
+});
+
+test("untable on an empty-body table → rows:0, only deleteTable", async () => {
+  const client = fakeClient({ sheets: [{ sheetId: 4, title: "Data", headers: ["A", "B"], tables: boundedTable() }] });
+  client.spreadsheetsGet = async (id) => ({ spreadsheetId: id, sheets: [{ data: [{ rowData: [] }] }] });
+  const api = makeSheetsApi("SS", client);
+
+  const res = await api.untable("Об");
+  assert.deepEqual(res, { ok: true, tableId: "t1", range: boundedTable()[0].range, rows: 0, untabled: true });
+  assert.equal(client.calls.at(-1).requests.length, 1);
+});
+
 // ── issue #10 #7: ensureSheet / ensureTable (idempotent structural ops) ───────
 
 test("ensureSheet returns the existing tab, or creates when missing", async () => {
