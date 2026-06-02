@@ -95,7 +95,9 @@ sheets.addTable(name, "Sheet!A1:I", { columns }): Promise<{ tableId, name }>
    values: […] ⇒ DROPDOWN column + ONE_OF_LIST rule
 sheets.ensureTable(name, "Sheet!A1:I", { columns }): Promise<{ tableId, name, existed }>  // idempotent
 sheets.updateTable(nameOrId, { name?, columns?, range? }): Promise<{ ok, tableId }>
-sheets.deleteTable(nameOrId): Promise<{ ok, tableId }>
+sheets.deleteTable(nameOrId, { deleteData? }): Promise<{ ok, tableId, preserved, rows }>
+   // removes the table but KEEPS its cells (values/format/notes) by default;
+   // pass { deleteData: true } for Google's native behavior, which also clears the range
 
 // Raw escape hatch — full Sheets v4 power for anything not covered by the sugar
 sheets.batchUpdate(requests): Promise<...>          // any Request[], dry-run aware

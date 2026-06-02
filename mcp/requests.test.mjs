@@ -9,7 +9,7 @@ import {
   buildFindReplace, buildSetNote, buildSetValidation, conditionFromSpec,
   buildDeveloperMetadata, META_KEY_IDEMPOTENCY,
   compileTableColumns, buildAddTable, buildUpdateTable, buildDeleteTable,
-  buildSetRowHeight, buildCopyFormat, buildUpdateCells,
+  buildSetRowHeight, buildCopyFormat, buildUpdateCells, buildRestoreCells,
 } from "./requests.mjs";
 
 const RANGE = { sheetId: 1, startRowIndex: 1, endRowIndex: 10, startColumnIndex: 1, endColumnIndex: 4 };
@@ -241,6 +241,14 @@ test("buildUpdateCells — formulas → formulaValue, fields default userEntered
     { userEnteredValue: { numberValue: 42 } },
     { userEnteredValue: { stringValue: "txt" } },
   ]);
+});
+
+test("buildRestoreCells — echoes CellData rows verbatim, value+format+note fields", () => {
+  const rows = [{ values: [{ userEnteredValue: { numberValue: 1 }, note: "n" }] }];
+  const [req] = buildRestoreCells(RANGE, rows);
+  assert.equal(req.updateCells.fields, "userEnteredValue,userEnteredFormat,note");
+  assert.deepEqual(req.updateCells.range, RANGE);
+  assert.equal(req.updateCells.rows, rows); // no re-encoding — same reference
 });
 
 test("buildAddConditionalFormat — boolean rule with format", () => {

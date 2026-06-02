@@ -1,6 +1,22 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
-import { colLetter, colToIdx, a1ToGridRange } from "./a1.mjs";
+import { colLetter, colToIdx, a1ToGridRange, gridRangeToA1 } from "./a1.mjs";
+
+test("gridRangeToA1 — bounded range round-trips with a1ToGridRange", () => {
+  const range = { sheetId: 4, startRowIndex: 0, endRowIndex: 6, startColumnIndex: 0, endColumnIndex: 9 };
+  assert.equal(gridRangeToA1("Data", range), "Data!A1:I6");
+  // quotes titles needing them, doubling internal quotes
+  assert.equal(gridRangeToA1("обязательства", range), "'обязательства'!A1:I6");
+  assert.equal(gridRangeToA1("A b", range), "'A b'!A1:I6");
+  assert.equal(gridRangeToA1("O'Brien", range), "'O''Brien'!A1:I6");
+  // round-trip: A1 → GridRange drops sheetId, so compare the index fields
+  const back = a1ToGridRange(4, gridRangeToA1("Data", range));
+  assert.deepEqual(back, range);
+});
+
+test("gridRangeToA1 — rejects an unbounded range", () => {
+  assert.throws(() => gridRangeToA1("Data", { sheetId: 4, startColumnIndex: 0, endColumnIndex: 2 }), /fully-bounded/);
+});
 
 test("colLetter — boundaries", () => {
   assert.equal(colLetter(0), "A");

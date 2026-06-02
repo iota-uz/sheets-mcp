@@ -13,7 +13,7 @@
  */
 
 import { createSheet, normHeader } from "./sheet.mjs";
-import { a1ToGridRange } from "./a1.mjs";
+import { a1ToGridRange, gridRangeToA1 } from "./a1.mjs";
 import {
   buildAddSheet,
   buildDeleteSheet,
@@ -22,6 +22,7 @@ import {
   buildAddTable,
   buildUpdateTable,
   buildDeleteTable,
+  buildRestoreCells,
   compileTableColumns,
 } from "./requests.mjs";
 
@@ -100,16 +101,25 @@ export function makeSheetsApi(spreadsheetId, client) {
     return a1ToGridRange(sheetId, rangeA1); // a1ToGridRange strips the prefix itself
   }
 
-  // Resolve a table name OR tableId string → tableId. Scans every sheet's tables.
-  async function resolveTableId(nameOrId) {
+  // Resolve a table name OR tableId string → { tableId, range, sheetTitle }.
+  // Scans every sheet's tables; sheetTitle comes from the owning sheet's props
+  // (matched by range.sheetId) so callers can build an A1 range for reads.
+  async function resolveTable(nameOrId) {
     const meta = await client.getSpreadsheet(spreadsheetId);
-    const tables = (meta.sheets || []).flatMap(s => s.tables || []);
-    const byName = tables.find(t => t.name === nameOrId);
-    if (byName) return byName.tableId;
-    const byId = tables.find(t => t.tableId === nameOrId);
-    if (byId) return byId.tableId;
-    const known = tables.map(t => t.name).filter(Boolean).join(", ");
-    throw new Error(`Table "${nameOrId}" not found. Known: ${known}`);
+    const sheets = meta.sheets || [];
+    const tables = sheets.flatMap(s => s.tables || []);
+    const t = tables.find(t => t.name === nameOrId) ?? tables.find(t => t.tableId === nameOrId);
+    if (!t) {
+      const known = tables.map(t => t.name).filter(Boolean).join(", ");
+      throw new Error(`Table "${nameOrId}" not found. Known: ${known}`);
+    }
+    const owner = sheets.find(s => s.properties?.sheetId === t.range?.sheetId);
+    return { tableId: t.tableId, range: t.range, sheetTitle: owner?.properties?.title };
+  }
+
+  // Thin wrapper for callers that only need the id.
+  async function resolveTableId(nameOrId) {
+    return (await resolveTable(nameOrId)).tableId;
   }
 
   // Negative sheetIds/"dryrun:" tableIds minted by the dry-run capture signal a
@@ -226,10 +236,41 @@ export function makeSheetsApi(spreadsheetId, client) {
       return { ok: true, tableId };
     },
 
-    async deleteTable(nameOrId) {
-      const tableId = await resolveTableId(nameOrId);
-      await client.batchUpdate(spreadsheetId, buildDeleteTable(tableId));
-      return { ok: true, tableId };
+    /**
+     * Remove a native Table. Google's DeleteTableRequest ALSO clears the table's
+     * cell data (header + all rows) — silent data loss (issue #11). So by default
+     * we read the cells (value + format + note), delete the table, and restore
+     * them in one atomic batchUpdate, mirroring the Sheets UI "Delete table"
+     * (which keeps data). Pass { deleteData: true } for Google's native behavior
+     * (clears the range too). Structured-reference formulas ([@[Col]]) can't
+     * survive the table's removal — an inherent Sheets limitation.
+     */
+    async deleteTable(nameOrId, opts = {}) {
+      const { tableId, range, sheetTitle } = await resolveTable(nameOrId);
+
+      if (opts.deleteData) {
+        await client.batchUpdate(spreadsheetId, buildDeleteTable(tableId));
+        return { ok: true, tableId, preserved: false };
+      }
+
+      // Read the table's current cells so we can restore them after the delete.
+      let rows = [];
+      if (range && sheetTitle) {
+        const a1 = gridRangeToA1(sheetTitle, range);
+        const data = await client.spreadsheetsGet(spreadsheetId, {
+          ranges: [a1],
+          includeGridData: true,
+          fields: "sheets(data(rowData(values(userEnteredValue,userEnteredFormat,note))))",
+        });
+        rows = data?.sheets?.[0]?.data?.[0]?.rowData ?? [];
+      }
+
+      const requests = buildDeleteTable(tableId);
+      if (rows.length > 0) {
+        requests.push(...buildRestoreCells(range, rows));
+      }
+      await client.batchUpdate(spreadsheetId, requests);
+      return { ok: true, tableId, preserved: true, rows: rows.length };
     },
   };
 }

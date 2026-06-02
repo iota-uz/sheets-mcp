@@ -45,7 +45,8 @@ The \`sheets\` global is bound to the spreadsheetId you passed in:
         DATE|TIME|DATE_TIME|BOOLEAN|DROPDOWN;  values:[…] ⇒ DROPDOWN + ONE_OF_LIST rule
   sheets.ensureTable(name, "Sheet!A1:I", { columns })  → { tableId, name, existed } — idempotent
   sheets.updateTable(nameOrId, { name?, columns?, range? })  → { ok, tableId }
-  sheets.deleteTable(nameOrId)            → { ok, tableId }
+  sheets.deleteTable(nameOrId, { deleteData? }) → { ok, tableId, preserved, rows }
+        keeps the cells by default (removes only the table); deleteData:true also clears the range
   sheet.toTable(name, { columns?, rows? }) → wrap THIS tab's header range as a Table
 
   Raw escape hatch (full Sheets v4 power — compile your own requests):

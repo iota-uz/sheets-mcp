@@ -94,6 +94,29 @@ function parseRef(token) {
  *   "A1:C" / "A:C5" open-ended
  *   "Sheet!A1:B2" / "'Sheet Name'!A1"  prefix stripped
  */
+/**
+ * Quote a sheet title for A1 use: wrap in single quotes (doubling any internal
+ * quote) when it isn't a bare token that A1 accepts unquoted.
+ */
+function quoteSheetTitle(title) {
+  return /^[A-Za-z0-9_]+$/.test(title) ? title : `'${String(title).replace(/'/g, "''")}'`;
+}
+
+/**
+ * Build an A1 range string ("'Title'!A1:I6") from a fully-bounded GridRange.
+ * Inverse of a1ToGridRange for the bounded case — used where the Sheets API
+ * accepts A1 only (spreadsheets.get `ranges`). Requires all four indices.
+ */
+export function gridRangeToA1(title, range) {
+  const { startRowIndex, endRowIndex, startColumnIndex, endColumnIndex } = range || {};
+  if (startRowIndex == null || endRowIndex == null || startColumnIndex == null || endColumnIndex == null) {
+    throw new Error(`gridRangeToA1: requires a fully-bounded GridRange, got ${JSON.stringify(range)}`);
+  }
+  const start = `${colLetter(startColumnIndex)}${startRowIndex + 1}`;
+  const end = `${colLetter(endColumnIndex - 1)}${endRowIndex}`;
+  return `${quoteSheetTitle(title)}!${start}:${end}`;
+}
+
 export function a1ToGridRange(sheetId, a1) {
   if (typeof a1 !== "string" || a1.trim() === "") {
     throw new Error(`a1ToGridRange: expected a non-empty A1 string, got ${JSON.stringify(a1)}`);

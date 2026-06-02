@@ -125,9 +125,12 @@ test("addTable rejects a range without a sheet prefix", async () => {
   await assert.rejects(api.addTable("T", "A1:C", { columns: [] }), /must include a sheet name/);
 });
 
+const boundedTable = () => ([
+  { tableId: "t1", name: "Об", range: { sheetId: 4, startRowIndex: 0, endRowIndex: 6, startColumnIndex: 0, endColumnIndex: 2 } },
+]);
+
 test("updateTable / deleteTable resolve a table by name", async () => {
-  const tables = [{ tableId: "t1", name: "Об", range: { sheetId: 4, startColumnIndex: 0, endColumnIndex: 2 } }];
-  const client = fakeClient({ sheets: [{ sheetId: 4, title: "Data", headers: ["A", "B"], tables }] });
+  const client = fakeClient({ sheets: [{ sheetId: 4, title: "Data", headers: ["A", "B"], tables: boundedTable() }] });
   const api = makeSheetsApi("SS", client);
 
   await api.updateTable("Об", { name: "Обязательства" });
@@ -135,10 +138,51 @@ test("updateTable / deleteTable resolve a table by name", async () => {
   assert.equal(upd.fields, "name");
   assert.deepEqual(upd.table, { tableId: "t1", name: "Обязательства" });
 
-  await api.deleteTable("Об");
-  assert.deepEqual(client.calls.at(-1).requests[0].deleteTable, { tableId: "t1" });
-
   await assert.rejects(api.deleteTable("Nope"), /not found/);
+});
+
+// issue #11: deleteTable must NOT destroy cell data. Default path deletes the
+// table then restores its cells in one atomic batch; deleteData opts back into
+// Google's native (destructive) behavior.
+test("deleteTable preserves cell data by default (issue #11 regression)", async () => {
+  const client = fakeClient({ sheets: [{ sheetId: 4, title: "Data", headers: ["A", "B"], tables: boundedTable() }] });
+  const api = makeSheetsApi("SS", client);
+
+  const res = await api.deleteTable("Об");
+  assert.deepEqual(res, { ok: true, tableId: "t1", preserved: true, rows: 1 });
+
+  const { requests } = client.calls.at(-1);
+  assert.deepEqual(requests[0].deleteTable, { tableId: "t1" });
+  // deleteTable runs FIRST, then cells are restored.
+  assert.ok(requests[1].updateCells, "expected an updateCells restore request");
+  assert.equal(requests[1].updateCells.fields, "userEnteredValue,userEnteredFormat,note");
+  assert.deepEqual(requests[1].updateCells.range, boundedTable()[0].range);
+});
+
+test("deleteTable({ deleteData: true }) emits only deleteTable", async () => {
+  const client = fakeClient({ sheets: [{ sheetId: 4, title: "Data", headers: ["A", "B"], tables: boundedTable() }] });
+  const api = makeSheetsApi("SS", client);
+
+  const res = await api.deleteTable("Об", { deleteData: true });
+  assert.deepEqual(res, { ok: true, tableId: "t1", preserved: false });
+
+  const { requests } = client.calls.at(-1);
+  assert.equal(requests.length, 1);
+  assert.deepEqual(requests[0].deleteTable, { tableId: "t1" });
+  assert.ok(!requests.some(r => r.updateCells), "no restore when deleteData:true");
+});
+
+test("deleteTable on an empty-body table emits only deleteTable", async () => {
+  const client = fakeClient({ sheets: [{ sheetId: 4, title: "Data", headers: ["A", "B"], tables: boundedTable() }] });
+  // No cells to restore.
+  client.spreadsheetsGet = async (id) => ({ spreadsheetId: id, sheets: [{ data: [{ rowData: [] }] }] });
+  const api = makeSheetsApi("SS", client);
+
+  const res = await api.deleteTable("Об");
+  assert.deepEqual(res, { ok: true, tableId: "t1", preserved: true, rows: 0 });
+  const { requests } = client.calls.at(-1);
+  assert.equal(requests.length, 1);
+  assert.deepEqual(requests[0].deleteTable, { tableId: "t1" });
 });
 
 // ── issue #10 #7: ensureSheet / ensureTable (idempotent structural ops) ───────

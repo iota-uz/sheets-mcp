@@ -335,6 +335,17 @@ export function buildUpdateCells(range, values, fields = "userEnteredValue") {
   return [{ updateCells: { range, rows, fields } }];
 }
 
+/**
+ * Write already-shaped CellData rows (as returned by spreadsheets.get gridData:
+ * [{ values: [CellData, …] }]) back into a GridRange. Unlike buildUpdateCells,
+ * this does NOT encode scalars — it echoes full CellData so userEnteredValue,
+ * userEnteredFormat, and notes survive. Used by deleteTable to restore the
+ * table's cells after the (data-destroying) DeleteTableRequest (issue #11).
+ */
+export function buildRestoreCells(range, rows, fields = "userEnteredValue,userEnteredFormat,note") {
+  return [{ updateCells: { range, rows, fields } }];
+}
+
 // ── Data validation ─────────────────────────────────────────────────────────
 
 function toRangeFormula(range) {
